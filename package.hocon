@@ -1,0 +1,32 @@
+// orbits: the solar system as a 3D Newtonian n-body problem, integrated in f64 and checked against
+// JPL Horizons.
+//
+//     sysl run .                      renders orbits.png from the J2000 epoch
+//     sysl run . -- --bench 200000    times the force loop (compare bench/force.c)
+
+package {
+  name    = "orbits"
+  version = "0.1.0"
+  sysl    = "0.1.0-alpha.12"
+}
+
+// The integrator's inner loop is the whole cost, and the comparison against C is made at -O2.
+optimization = "2"
+
+requires {
+  os   = true
+  heap = true
+}
+
+// `quaternion` is unreleased, so it is a sibling checkout (`git clone` sysl-lang/quaternion beside
+// this repository) rather than a coordinate; it becomes `{ git = ..., version = "0.1.0" }` when it is
+// tagged.
+dependencies {
+  quaternion { path = "../quaternion" }
+  cairo      { git = "github.com/sysl-lang/cairo", version = "0.3.3" }
+}
+
+// The tests decode the PNG cairo writes with a decoder that is not cairo's.
+dev_dependencies {
+  png { git = "github.com/sysl-lang/png", version = "0.1.1" }
+}

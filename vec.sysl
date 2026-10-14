@@ -1,0 +1,44 @@
+// A 3-vector of `real`, by value: a position in AU or a velocity in AU/day.
+//
+// The operators are the ones a page of mechanics writes -- `a + b`, `r * k`, `k * r` -- so the
+// integrators below read as the formulas they implement.
+
+import sysl.math.Float
+
+struct Vec3
+    x: real
+    y: real
+    z: real
+
+    zero() -> Vec3 = Vec3(0.0, 0.0, 0.0)
+
+    of(a: [3]real) -> Vec3 = Vec3(a[0], a[1], a[2])
+
+    arr(self) -> [3]real = [self.x, self.y, self.z]
+
+    dot(self, rhs: Vec3) -> real = self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
+
+    cross(self, rhs: Vec3) -> Vec3 =
+        Vec3(self.y * rhs.z - self.z * rhs.y, self.z * rhs.x - self.x * rhs.z, self.x * rhs.y - self.y * rhs.x)
+
+    norm2(self) -> real = self.dot(self)
+
+    norm(self) -> real = self.norm2().sqrt()
+
+impl Add for Vec3
+    add(self, rhs: Vec3) -> Vec3 = Vec3(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+
+impl Sub for Vec3
+    sub(self, rhs: Vec3) -> Vec3 = Vec3(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+
+impl Neg for Vec3
+    neg(self) -> Vec3 = Vec3(-self.x, -self.y, -self.z)
+
+impl Mul[real] for Vec3
+    mul(self, k: real) -> Vec3 = Vec3(self.x * k, self.y * k, self.z * k)
+
+impl Mul[Vec3, Vec3] for real
+    mul(self, v: Vec3) -> Vec3 = v * self
+
+impl Eq for Vec3
+    eq(self, rhs: Vec3) -> bool = self.x == rhs.x && self.y == rhs.y && self.z == rhs.z

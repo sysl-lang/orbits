@@ -1,0 +1,380 @@
+@tests
+
+// What orbits computes, asserted against oracles that do not share its code:
+//
+// - **JPL Horizons** (DE441) for where the bodies actually are, 30 days, a year and ten years on;
+// - **conservation laws** for what a symplectic integrator owes over a thousand years;
+// - **the closed-form two-body solution** for what the integrators owe on the one problem with one;
+// - **bisection** (a different method from the Newton under test, run in Python's float) for
+//   Kepler's equation, hard-coded below;
+// - **an independent PNG decoder** (sysl-lang/png) for the image cairo writes.
+
+import sh.sysl.png
+import sysl.buf.{Buf, buf}
+import sysl.math.{Float, max}
+
+private const pi: real = 3.141592653589793
+
+private distance(a: Vec3, b: Vec3) -> real = (a - b).norm()
+
+private near(a: real, b: real, tol: real) -> bool = (a - b).abs() <= tol
+
+// The largest distance from Horizons over bodies `from..<to`, after integrating the epoch's state to
+// `horizons_dates[d]` with `how` at a step of `dt` days.
+private worst(how: Integrator, dt: real, d: int, from: usize, to: usize) -> real
+    val s = horizons_system(0)
+    val truth = horizons_system(d)
+    val steps = int(((horizons_dates[d] - horizons_dates[0]) / dt).round())
+    var err = 0.0
+
+    advance(s, dt, steps, how)
+    for b in from..<to
+        err = max(err, distance(s.pos[b], truth.pos[b]))
+    err
+
+// -- against JPL Horizons ----------------------------------------------------------------------------
+//
+// The model is eleven Newtonian point masses. What it leaves out sets the floor, and the floor rises
+// with time: general relativity advances Mercury's perihelion by 43" a century (the largest error,
+// already 6e-8 AU after 30 days), the asteroid belt (Ceres, Vesta, Pallas and the rest, in DE441 and
+// not here) perturbs the inner planets by 1e-6 AU over a decade, and the Earth and Moon are not
+// point masses to each other. The outer planets feel almost none of it, so they get a tolerance of
+// their own, a hundred times tighter. The integration error at dt = 0.05 d is far below all of this:
+// Yoshida and RK4 agree with each other to 1e-9 AU at ten years.
+
+@test("every body is where Horizons has it 30 days on")
+horizons_30_days()
+    assert(worst(Integrator.Yoshida, 0.05, 1, 0, 11) < 2e-7, "within 2e-7 AU (30,000 km)")
+    assert(worst(Integrator.Yoshida, 0.05, 1, 6, 11) < 1e-9, "Jupiter to Pluto within 1e-9 AU")
+
+@test("every body is where Horizons has it a year on")
+horizons_1_year()
+    assert(worst(Integrator.Yoshida, 0.05, 2, 0, 11) < 2e-6, "within 2e-6 AU")
+    assert(worst(Integrator.Yoshida, 0.05, 2, 6, 11) < 2e-8, "Jupiter to Pluto within 2e-8 AU")
+
+@test("every body is where Horizons has it ten years on")
+horizons_10_years()
+    assert(worst(Integrator.Yoshida, 0.05, 3, 0, 11) < 4e-5, "within 4e-5 AU (Mercury's relativity)")
+    assert(worst(Integrator.Yoshida, 0.05, 3, 6, 11) < 2e-6, "Jupiter to Pluto within 2e-6 AU")
+
+    val earth = worst(Integrator.Yoshida, 0.05, 3, 3, 4)
+    assert(earth < 1e-5 && earth > 1e-7, "the Earth is off by the asteroids' pull, and only that")
+
+@test("all three integrators agree with Horizons at 30 days, and leapfrog least")
+horizons_three_integrators()
+    val leap = worst(Integrator.Leapfrog, 0.05, 1, 0, 11)
+    val yosh = worst(Integrator.Yoshida, 0.05, 1, 0, 11)
+    val rk = worst(Integrator.Rk4, 0.05, 1, 0, 11)
+
+    assert(leap < 3e-6 && yosh < 2e-7 && rk < 2e-7, "each within its order's tolerance")
+    assert(leap > 5.0 * yosh, "second order is visibly worse than fourth at the same step")
+    assert(near(yosh, rk, 1e-9), "two fourth-order methods converge on the same answer")
+
+// -- conservation over a thousand years --------------------------------------------------------------
+
+// The Sun, the planets and Pluto without the Moon, whose 27-day orbit a one-day step cannot follow.
+private planets() -> System
+    val all = horizons_system(0)
+    var names = buf[string]()
+    var gm = buf[real]()
+    var pos = buf[Vec3]()
+    var vel = buf[Vec3]()
+
+    for b in 0..<all.count()
+        if all.names[b] == "Moon" then continue
+        names.push(all.names[b])
+        gm.push(all.gm[b])
+        pos.push(all.pos[b])
+        vel.push(all.vel[b])
+    system(names, gm, pos, vel, all.t)
+
+// The largest relative excursion of the energy and of the angular momentum over `years`, sampled
+// once a year, integrating with `how` at one day a step.
+private drift(how: Integrator, years: int) -> (real, real)
+    val s = planets()
+    val e0 = s.energy()
+    val l0 = s.angular_momentum()
+    var de = 0.0
+    var dl = 0.0
+
+    for _ in 0..<years
+        advance(s, 1.0, 365, how)
+        de = max(de, ((s.energy() - e0) / e0).abs())
+        dl = max(dl, distance(s.angular_momentum(), l0) / l0.norm())
+    (de, dl)
+
+@test("a symplectic integrator keeps energy bounded for a thousand years, and RK4 does not")
+energy_over_a_thousand_years()
+    val (yoshida_e, yoshida_l) = drift(Integrator.Yoshida, 1000)
+    val (leap_e, leap_l) = drift(Integrator.Leapfrog, 1000)
+    val (rk_e, rk_l) = drift(Integrator.Rk4, 1000)
+
+    assert(yoshida_e < 1e-7, "Yoshida's energy error stays below 1e-7 (Mercury gets 88 steps an orbit)")
+    assert(leap_e < 1e-5, "leapfrog's is larger, being second order, but bounded")
+    assert(yoshida_l < 1e-13 && leap_l < 1e-13, "both conserve angular momentum to rounding")
+    assert(rk_e > 10.0 * yoshida_e, "RK4 drifts measurably more than Yoshida")
+    assert(rk_l > 100.0 * yoshida_l, "and loses angular momentum, which no symplectic method does")
+
+@test("RK4's energy error grows with time and Yoshida's does not")
+energy_grows_only_for_rk4()
+    val (rk_short, _) = drift(Integrator.Rk4, 100)
+    val (rk_long, _) = drift(Integrator.Rk4, 1000)
+    val (y_short, _) = drift(Integrator.Yoshida, 100)
+    val (y_long, _) = drift(Integrator.Yoshida, 1000)
+
+    assert(rk_long > 5.0 * rk_short, "secular: ten times the time, several times the error")
+    assert(y_long < 3.0 * y_short, "bounded: the error oscillates rather than accumulating")
+
+@test("total momentum is conserved and the barycentre moves in a straight line")
+momentum_is_conserved()
+    val s = horizons_system(0)
+    val (r0, v0) = s.barycentre()
+
+    advance(s, 0.5, 2000, Integrator.Yoshida)
+    val (r1, v1) = s.barycentre()
+    assert(distance(v1, v0) < 1e-19, "the barycentre's velocity does not change")
+    assert(distance(r1, r0 + v0 * 1000.0) < 1e-15, "so it has moved by v t")
+
+@test("leapfrog run forward and then backward returns to where it started")
+leapfrog_is_reversible()
+    val s = horizons_system(0)
+    val start = s.copy()
+    val n = 20000
+
+    advance(s, 0.5, n, Integrator.Leapfrog)
+    assert(distance(s.pos[3], start.pos[3]) > 1.0, "the Earth has gone somewhere")
+    advance(s, -0.5, n, Integrator.Leapfrog)
+
+    var err = 0.0
+    for b in 0..<s.count()
+        err = max(err, distance(s.pos[b], start.pos[b]) / max(1.0, start.pos[b].norm()))
+    assert(err < 16.0 * real(n) * real.epsilon(), "within a few ulps of the position per step")
+
+@test("RK4 run forward and backward does not return: it is not time-symmetric")
+rk4_is_not_reversible()
+    val s = horizons_system(0)
+    val start = s.copy()
+
+    advance(s, 0.5, 20000, Integrator.Rk4)
+    advance(s, -0.5, 20000, Integrator.Rk4)
+    assert(distance(s.pos[4], start.pos[4]) > 1e-9, "the Moon is measurably elsewhere")
+
+// -- Kepler's equation -------------------------------------------------------------------------------
+
+@test("Kepler's equation against bisection")
+kepler_against_bisection()
+    assert(near(kepler(1.0, 0.5), 1.4987011335178484, 1e-15), "a textbook case")
+    assert(near(kepler(0.1, 0.999), 0.8515505079998895, 1e-14), "e near 1, M near periapsis")
+    assert(near(kepler(3.0, 0.9), 3.0670374966306886, 1e-15), "near apoapsis")
+    assert(near(kepler(1e-6, 0.99), 9.999998350000887e-05, 1e-18), "a tiny M keeps its precision")
+    assert(near(kepler(-2.0, 0.3), -2.2360314951724365, 1e-15), "a negative M")
+    assert(near(kepler(10.0, 0.2), 9.907212546064978, 1e-14), "more than a turn")
+
+@test("the hyperbolic Kepler equation against bisection")
+hyperbolic_kepler_against_bisection()
+    assert(near(kepler_hyperbolic(1.0, 1.5), 1.1616354445046073, 1e-15), "a textbook case")
+    assert(near(kepler_hyperbolic(0.01, 1.0001), 0.38997463886046324, 1e-13), "nearly parabolic")
+    assert(near(kepler_hyperbolic(100.0, 2.0), 4.650719622246867, 1e-14), "a large M")
+    assert(near(kepler_hyperbolic(-5.0, 1.2), -2.5369168652542156, 1e-14), "a negative M")
+    assert(near(kepler_hyperbolic(1e6, 3.0), 13.410058859827306, 1e-13), "a huge M, without overflow")
+
+@test("Kepler's equation at its edges")
+kepler_edges()
+    assert_eq(kepler(0.7, 0.0), 0.7, "a circle: E is M exactly")
+    assert(kepler(0.0, 0.3) == 0.0 && kepler(0.0, 0.9).abs() < 1e-30, "M = 0 is periapsis at every e")
+    assert(near(kepler(pi, 0.999999), pi, 1e-15), "M = pi is apoapsis at every e")
+    assert(near(kepler(2.0 * pi + 0.5, 0.3), kepler(0.5, 0.3) + 2.0 * pi, 1e-14), "whole turns pass through")
+    assert_eq(kepler_hyperbolic(0.0, 1.5), 0.0, "H = 0 at periapsis")
+
+    for m in [0.001, 0.5, 2.0, 3.1]
+        for e in [0.0, 0.1, 0.5, 0.9, 0.99, 0.999999]
+            val big_e = kepler(m, e)
+            assert(near(big_e - e * big_e.sin(), m, 4e-16 * 8.0), "the residual is rounding")
+
+@test("Kepler's equation outside its domain is NaN, as sysl.math's functions are")
+kepler_domain()
+    assert(kepler(1.0, 1.0).is_nan(), "a parabola has no eccentric anomaly")
+    assert(kepler(1.0, -0.1).is_nan(), "nor does a negative eccentricity")
+    assert(kepler(1.0, real.nan()).is_nan(), "a NaN eccentricity")
+    assert(kepler(real.infinity(), 0.5).is_nan(), "an infinite anomaly")
+    assert(kepler_hyperbolic(1.0, 1.0).is_nan(), "a parabola is not a hyperbola either")
+    assert(kepler_hyperbolic(1.0, 0.5).is_nan(), "nor is an ellipse")
+
+// -- orbital elements ---------------------------------------------------------------------------------
+
+private const mu_sun: real = 0.00029591220828411956
+
+private same_state(a: (Vec3, Vec3), b: (Vec3, Vec3), tol: real) -> bool =
+    distance(a.0, b.0) <= tol * a.0.norm() && distance(a.1, b.1) <= tol * a.1.norm()
+
+private val cases: [6]Elements = [
+    Elements(1.0, 0.0167, 0.1, 1.2, 0.4, 2.0),
+    Elements(5.2, 0.5, 1.3, -2.0, 2.5, -1.0),
+    Elements(2.0, 0.999, 0.6, 0.3, 1.0, 0.05),
+    Elements(-1.0, 1.5, 0.4, 0.8, -1.1, 0.7),
+    Elements(-0.3, 1.0001, 2.9, 1.0, 0.2, -0.01),
+    Elements(30.0, 0.25, 3.0, 4.0, 5.0, 6.0)]
+
+@test("elements to state and back gives the same elements")
+elements_round_trip()
+    for el in cases
+        val (r, v) = to_state(el, mu_sun)
+        val back = from_state(r, v, mu_sun)
+        val again = to_state(back, mu_sun)
+
+        assert(near(back.a, el.a, 1e-10 * el.a.abs()), "a")
+        assert(near(back.e, el.e, 1e-12), "e")
+        assert(near(back.i, el.i, 1e-12), "i")
+        // Near e = 1 the state depends on e through 1 - e, so the round trip loses digits in
+        // proportion to 1 / |1 - e|: e = 1.0001 keeps eleven, a planet's orbit fifteen.
+        assert(same_state((r, v), again, 4e-15 / (1.0 - el.e).abs()), "and the state it names")
+
+@test("an orbit's state against Earth's from Horizons: the elements reproduce the vector")
+elements_of_the_earth()
+    // The Sun-centred Earth-Moon barycentre would be the textbook choice; the Earth itself, relative
+    // to the Sun, with mu the Sun's plus the Earth's, is close to a 1 AU, e = 0.017 orbit.
+    val s = horizons_system(0)
+    val r = s.pos[3] - s.pos[0]
+    val v = s.vel[3] - s.vel[0]
+    val el = from_state(r, v, s.gm[0] + s.gm[3])
+
+    assert(near(el.a, 1.0, 0.01), "a is an astronomical unit")
+    assert(near(el.e, 0.0167, 0.002), "e is the Earth's")
+    assert(el.i < 1e-4, "the ecliptic is the Earth's orbital plane")
+    assert(same_state((r, v), to_state(el, s.gm[0] + s.gm[3]), 1e-12), "and the state comes back")
+
+@test("degenerate elements follow the stated conventions")
+degenerate_elements()
+    val circle = from_state(Vec3(1.0, 0.0, 0.0), Vec3(0.0, mu_sun.sqrt(), 0.0), mu_sun)
+    assert(circle.e < 1e-12 && circle.i == 0.0, "circular and equatorial")
+    assert(circle.raan == 0.0 && circle.argp == 0.0 && circle.m.abs() < 1e-12, "everything from the x axis")
+
+    val tilted = from_state(Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, mu_sun.sqrt()), mu_sun)
+    assert(near(tilted.i, 0.5 * pi, 1e-15), "polar")
+    assert(near(tilted.raan, 0.5 * pi, 1e-15), "the node is on +y")
+    assert(near(tilted.m, 0.0, 1e-12), "and a circular orbit counts its anomaly from the node")
+
+    val retro = from_state(Vec3(1.0, 0.0, 0.0), Vec3(0.0, -1.2 * mu_sun.sqrt(), 0.0), mu_sun)
+    assert(near(retro.i, pi, 1e-15) && retro.raan == 0.0, "retrograde equatorial")
+    assert(same_state((Vec3(1.0, 0.0, 0.0), Vec3(0.0, -1.2 * mu_sun.sqrt(), 0.0)), to_state(retro, mu_sun), 1e-12),
+           "and its state comes back")
+
+// -- the two-body problem against its closed form ----------------------------------------------------
+
+// A massless body around a fixed Sun, integrated with Yoshida for `days` at `dt`, against Kepler's
+// solution. Answers the worst position error along the way, relative to the orbit's size.
+private two_body(el: Elements, dt: real, days: real) -> real
+    val (r, v) = to_state(el, mu_sun)
+    var names = buf[string]()
+    var gm = buf[real]()
+    var pos = buf[Vec3]()
+    var vel = buf[Vec3]()
+
+    names.push("Sun")
+    gm.push(mu_sun)
+    pos.push(Vec3.zero())
+    vel.push(Vec3.zero())
+    names.push("body")
+    gm.push(0.0)
+    pos.push(r)
+    vel.push(v)
+
+    val s = system(names, gm, pos, vel, 0.0)
+    val steps = int((days / dt).round())
+    val every = steps / 50
+    var err = 0.0
+    for k in 1..steps
+        step(s, dt, Integrator.Yoshida)
+        if k % every == 0
+            val (want, _) = to_state(el.propagate(mu_sun, real(k) * dt), mu_sun)
+            err = max(err, distance(s.pos[1], want) / el.a.abs())
+    err
+end two_body
+
+// Yoshida is fourth order, so halving the step divides the error by 16: the ratio is the check that
+// the integrator is the method it claims to be, and the closed form is what makes it measurable.
+private fourth_order(el: Elements, dt: real, days: real, tol: real) -> bool
+    val coarse = two_body(el, dt, days)
+    val fine = two_body(el, 0.5 * dt, days)
+    fine < tol && coarse / fine > 12.0 && coarse / fine < 20.0
+
+@test("a circular orbit integrated for one period matches Kepler, converging at fourth order")
+two_body_circular()
+    assert(fourth_order(Elements(1.0, 0.0, 0.3, 0.2, 0.0, 0.0), 0.5, 365.25, 4e-9), "e = 0")
+
+@test("an eccentric orbit integrated for one period matches Kepler, converging at fourth order")
+two_body_eccentric()
+    assert(fourth_order(Elements(1.5, 0.5, 0.3, 0.2, 1.0, 0.0), 0.2, 670.0, 5e-10), "e = 0.5")
+
+@test("a nearly parabolic orbit through periapsis matches Kepler")
+two_body_near_parabolic()
+    assert(two_body(Elements(2.0, 0.95, 0.3, 0.2, 1.0, -0.3), 0.005, 400.0) < 1e-7, "e = 0.95")
+
+@test("a hyperbolic flyby matches Kepler")
+two_body_hyperbolic()
+    assert(two_body(Elements(-1.0, 1.5, 0.3, 0.2, 1.0, -1.5), 0.02, 300.0) < 1e-9, "e = 1.5")
+
+// -- the camera and the picture ----------------------------------------------------------------------
+
+@test("the camera projects through its orientation quaternion")
+camera_projection()
+    val top = look_at_origin(0.0, 0.5 * pi, 10.0, 100.0, 50.0, 50.0)
+    val (cx, cy) = top.project(Vec3.zero()).unwrap()
+    assert(near(cx, 50.0, 1e-12) && near(cy, 50.0, 1e-12), "the origin is the centre")
+
+    val (xx, xy) = top.project(Vec3(1.0, 0.0, 0.0)).unwrap()
+    assert(near(xx, 60.0, 1e-12) && near(xy, 50.0, 1e-12), "from above, +x is to the right, f/d per AU")
+
+    val (yx, yy) = top.project(Vec3(0.0, 1.0, 0.0)).unwrap()
+    assert(near(yx, 50.0, 1e-12) && near(yy, 40.0, 1e-12), "and +y is up")
+
+    assert(top.project(Vec3(0.0, 0.0, 11.0)).is_none(), "behind the camera is not drawn")
+
+    val side = look_at_origin(0.0, 0.0, 10.0, 100.0, 50.0, 50.0)
+    val (_, zy) = side.project(Vec3(0.0, 0.0, 1.0)).unwrap()
+    assert(near(zy, 40.0, 1e-12), "from the side, the ecliptic pole is up")
+
+// Pixel (x, y) of the image cairo drew, as (r, g, b): ARGB32 is a native-endian 32-bit word, so B G R A
+// in memory here.
+private pixel(data: []u8, stride: int, x: int, y: int) -> (int, int, int)
+    val i = y * stride + 4 * x
+    (int(data[i + 2]), int(data[i + 1]), int(data[i]))
+
+private colour_of(c: [3]real) -> (int, int, int) = (channel(c[0]), channel(c[1]), channel(c[2]))
+
+// How cairo turns a colour component into a byte: rounded to 16 bits, then the high byte.
+private channel(c: real) -> int = int(c * 65535.0 + 0.5) >> 8
+
+@test("the picture has the Sun and the Earth where the camera puts them")
+picture_pixels()
+    val s = horizons_system(0)
+    val surface = draw(s.copy())
+    val data = surface.data()
+    val stride = surface.stride()
+
+    assert_eq(pixel(data, stride, 2, 2), colour_of(background), "a corner is the background")
+
+    val (sx, sy) = inner_camera().project(s.pos[0]).unwrap()
+    assert_eq(pixel(data, stride, int(sx), int(sy)), colour_of(body_colours[0]), "the Sun, in the inner panel")
+    val (ox, oy) = outer_camera().project(s.pos[0]).unwrap()
+    assert_eq(pixel(data, stride, int(ox), int(oy)), colour_of(body_colours[0]), "and in the outer one")
+
+    val (ex, ey) = inner_camera().project(s.pos[3]).unwrap()
+    assert_eq(pixel(data, stride, int(ex), int(ey)), colour_of(body_colours[3]), "the Earth at J2000")
+
+    val (jx, jy) = outer_camera().project(s.pos[6]).unwrap()
+    assert_eq(pixel(data, stride, int(jx), int(jy)), colour_of(body_colours[6]), "Jupiter at J2000")
+
+@test("the PNG cairo writes decodes, by an independent decoder, to the pixels it drew")
+picture_png()
+    val surface = draw(horizons_system(0))
+    val data = surface.data()
+    val stride = surface.stride()
+    val bytes = surface.png_bytes().expect("cairo encodes the image")
+    val image = png.decode(bytes.view()).expect("png decodes it")
+
+    assert(image.width == 1200 && image.height == 600, "both panels")
+    for (x, y) in [(2, 2), (300, 300), (900, 300), (599, 0), (1199, 599)]
+        val p = image.at(usize(x), usize(y))
+        assert_eq((int(p.r), int(p.g), int(p.b)), pixel(data, stride, x, y), "the same pixel")
+end picture_png

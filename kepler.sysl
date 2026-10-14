@@ -1,0 +1,163 @@
+// The two-body problem in closed form: Kepler's equation, and conversion between a state vector and
+// the six classical orbital elements.
+//
+// Angles are radians. `a` is negative for a hyperbola, as the energy equation `v^2/2 - mu/r = -mu/2a`
+// makes it, and `m` is then the hyperbolic mean anomaly `e sinh H - H`. A parabola (`e == 1`) has no
+// finite `a` and is outside this representation: Kepler's equation answers NaN there, which is what
+// `sysl.math` answers for an argument outside a function's domain.
+
+import sh.sysl.quaternion.Quaternion
+import sysl.math.{Float, min}
+
+/** `a` (AU), `e`, inclination `i`, longitude of the ascending node `raan`, argument of periapsis
+ * `argp`, and mean anomaly `m` -- the classical set.
+ *
+ * Where an angle is undefined, the convention is the usual one: an equatorial orbit (`i` 0 or pi)
+ * has `raan = 0` and measures `argp` from the x axis; a circular one has `argp = 0` and measures the
+ * anomaly from the node.
+ */
+struct Elements
+    a: real
+    e: real
+    i: real
+    raan: real
+    argp: real
+    m: real
+
+    /** Mean motion, radians per day, under gravitational parameter `mu`. */
+    mean_motion(self, mu: real) -> real = (mu / (self.a * self.a * self.a).abs()).sqrt()
+
+    /** The same orbit `dt` days later: only the mean anomaly moves. */
+    propagate(self, mu: real, dt: real) -> Elements =
+        Elements(self.a, self.e, self.i, self.raan, self.argp, self.m + self.mean_motion(mu) * dt)
+
+private const pi: real = 3.141592653589793
+private const two_pi: real = 6.283185307179586
+private const eps: real = 2.220446049250313e-16
+
+/** The eccentric anomaly `E` with `E - e sin E = m`, for `0 <= e < 1`, by Newton's method.
+ *
+ * `m` is reduced to `[-pi, pi]` first and the whole turns put back afterwards, so the answer is
+ * continuous in `m`. The start is `m` for a nearly circular orbit and `pi` (with `m`'s sign) past
+ * `e = 0.8`, where Newton from `m` can overshoot: from there the iteration is monotone for every `m`.
+ * Out of domain -- `e < 0`, `e >= 1`, or a NaN -- the answer is NaN.
+ */
+kepler(m: real, e: real) -> real
+    if !(e >= 0.0 && e < 1.0) || !m.is_finite() then return real.nan()
+
+    val turns = ((m + pi) / two_pi).floor()
+    val mr = m - turns * two_pi
+    var big_e = if e > 0.8 then pi.copysign(mr) else mr
+
+    for _ in 0..<64
+        val f = big_e - e * big_e.sin() - mr
+        val step = f / (1.0 - e * big_e.cos())
+        big_e -= step
+        if step.abs() <= 4.0 * eps * (1.0 + big_e.abs()) then break
+
+    big_e + turns * two_pi
+end kepler
+
+/** The hyperbolic anomaly `H` with `e sinh H - H = m`, for `e > 1`, by Newton's method. NaN out of
+ * domain.
+ *
+ * The left side is odd, increasing and convex for `H > 0`, so Newton started at or beyond the root
+ * closes in from one side without overshooting. The start is the least of three upper bounds on
+ * `|H|`: `cbrt(6|m|)` (since `e sinh H - H >= H^3/6`), `|m| / (e - 1)` (since it is `>= (e - 1) H`),
+ * and, from `|m| >= 3`, `asinh(2|m| / e)`. The first two keep a near-parabolic orbit from starting
+ * at an `H` whose `sinh` overflows; the third keeps a large `|m|` from taking a hundred steps.
+ */
+kepler_hyperbolic(m: real, e: real) -> real
+    if !(e > 1.0) || !m.is_finite() then return real.nan()
+
+    val am = m.abs()
+    var h = min((6.0 * am).cbrt(), am / (e - 1.0))
+    if am >= 3.0 then h = min(h, (2.0 * am / e).asinh())
+    h = h.copysign(m)
+
+    for _ in 0..<100
+        val f = e * h.sinh() - h - m
+        val step = f / (e * h.cosh() - 1.0)
+        h -= step
+        if step.abs() <= 4.0 * eps * (1.0 + h.abs()) then break
+    h
+end kepler_hyperbolic
+
+/** The rotation from the perifocal frame (x toward periapsis, z along the angular momentum) to the
+ * reference frame: `Rz(raan) Rx(i) Rz(argp)`, composed as quaternions.
+ */
+perifocal_rotation(el: Elements) -> Quaternion[real] =
+    Quaternion.from_axis_angle([0.0, 0.0, 1.0], el.raan) *
+        Quaternion.from_axis_angle([1.0, 0.0, 0.0], el.i) *
+        Quaternion.from_axis_angle([0.0, 0.0, 1.0], el.argp)
+
+/** Position and velocity from elements, under gravitational parameter `mu`. */
+to_state(el: Elements, mu: real) -> (Vec3, Vec3)
+    val e = el.e
+    var px = 0.0
+    var py = 0.0
+    var vx = 0.0
+    var vy = 0.0
+
+    if e < 1.0
+        val big_e = kepler(el.m, e)
+        val (s, c) = (big_e.sin(), big_e.cos())
+        val b = (1.0 - e * e).sqrt()
+        val k = (mu * el.a).sqrt() / (el.a * (1.0 - e * c))
+        px = el.a * (c - e)
+        py = el.a * b * s
+        vx = -k * s
+        vy = k * b * c
+    else
+        val h = kepler_hyperbolic(el.m, e)
+        val (s, c) = (h.sinh(), h.cosh())
+        val b = (e * e - 1.0).sqrt()
+        val k = (mu / -el.a).sqrt() / (e * c - 1.0)
+        px = el.a * (c - e)
+        py = -el.a * b * s
+        vx = -k * s
+        vy = k * b * c
+
+    val q = perifocal_rotation(el)
+    (Vec3.of(q.rotate([px, py, 0.0])), Vec3.of(q.rotate([vx, vy, 0.0])))
+end to_state
+
+/** Below this, an eccentricity is circular and an inclination equatorial, for choosing conventions. */
+private const degenerate: real = 1e-11
+
+/** Elements from a position and velocity, under gravitational parameter `mu`. */
+from_state(r: Vec3, v: Vec3, mu: real) -> Elements
+    val rn = r.norm()
+    val h = r.cross(v)
+    val hn = h.norm()
+    val hat_h = h * (1.0 / hn)
+    val ev = (r * (v.norm2() - mu / rn) - v * r.dot(v)) * (1.0 / mu)
+    val e = ev.norm()
+    val a = -mu / (2.0 * (0.5 * v.norm2() - mu / rn))
+    val i = (h.x * h.x + h.y * h.y).sqrt().atan2(h.z)
+
+    // The node line, or the x axis where there is none.
+    val nxy = (h.x * h.x + h.y * h.y).sqrt()
+    val raan = if nxy > degenerate * hn then h.x.atan2(-h.y) else 0.0
+    val node = Vec3(raan.cos(), raan.sin(), 0.0)
+    val across = hat_h.cross(node)
+
+    var argp = 0.0
+    var nu = 0.0
+    if e > degenerate
+        argp = ev.dot(across).atan2(ev.dot(node))
+        val hat_e = ev * (1.0 / e)
+        nu = r.dot(hat_h.cross(hat_e)).atan2(r.dot(hat_e))
+    else
+        nu = r.dot(across).atan2(r.dot(node))
+
+    var m = 0.0
+    if e < 1.0
+        val big_e = ((1.0 - e * e).sqrt() * nu.sin()).atan2(e + nu.cos())
+        m = big_e - e * big_e.sin()
+    else
+        val hh = 2.0 * (((e - 1.0) / (e + 1.0)).sqrt() * (0.5 * nu).tan()).atanh()
+        m = e * hh.sinh() - hh
+
+    Elements(a, e, i, raan, argp, m)
+end from_state

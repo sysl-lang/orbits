@@ -1,0 +1,102 @@
+// Three integrators, switchable, each advancing a `System` by one step of `dt` days in place.
+//
+// - `Rk4`: classical fourth-order Runge-Kutta. Accurate per step, but not symplectic: its energy
+//   error grows without bound, which the conservation tests measure.
+// - `Leapfrog`: velocity Verlet (kick-drift-kick). Second order, symplectic and time-reversible: a
+//   step of `-dt` undoes a step of `dt` up to rounding.
+// - `Yoshida`: Yoshida's fourth-order composition of three leapfrog steps (1990), with weights
+//   `w1, w0, w1` where `w1 = 1 / (2 - 2^(1/3))` and `w0 = 1 - 2 w1`. Symplectic and fourth order.
+
+import sysl.buf.Buf
+
+enum Integrator
+    Rk4
+    Leapfrog
+    Yoshida
+
+/** One step of `dt` days with the chosen integrator. */
+step(s: System, dt: real, how: Integrator)
+    how match
+        Integrator.Rk4 -> rk4(s, dt)
+        Integrator.Leapfrog -> leapfrog(s, dt)
+        Integrator.Yoshida -> yoshida(s, dt)
+
+/** `steps` steps of `dt`. */
+advance(s: System, dt: real, steps: int, how: Integrator)
+    for _ in 0..<steps
+        step(s, dt, how)
+
+private const cbrt2: real = 1.2599210498948732
+private const w1: real = 1.0 / (2.0 - cbrt2)
+private const w0: real = 1.0 - 2.0 * w1
+
+/** Kick-drift-kick. `s.acc` is current on entry and on exit, so it costs one force evaluation. */
+leapfrog(s: System, dt: real)
+    val n = s.count()
+    var v = s.vel.view()
+    var x = s.pos.view()
+    val a = s.acc.view()
+    val half = 0.5 * dt
+
+    for i in 0..<n
+        v[i] = v[i] + a[i] * half
+        x[i] = x[i] + v[i] * dt
+    accelerations(s.gm, s.pos, s.acc)
+    for i in 0..<n
+        v[i] = v[i] + a[i] * half
+end leapfrog
+
+yoshida(s: System, dt: real)
+    leapfrog(s, w1 * dt)
+    leapfrog(s, w0 * dt)
+    leapfrog(s, w1 * dt)
+
+/** Runge-Kutta 4 over the state `(x, v)`, whose derivative is `(v, a(x))`. */
+rk4(s: System, dt: real)
+    val n = s.count()
+    val x0 = s.pos.copy()
+    val v0 = s.vel.copy()
+    var dx = buf_of(n)
+    var dv = buf_of(n)
+    val half = 0.5 * dt
+
+    // k1 is the state as it stands: s.acc is current.
+    stage(s, x0, v0, s.vel, s.acc, half, dx, dv, 1.0 / 6.0 * dt)
+    // k2 at the midpoint along k1
+    accelerations(s.gm, s.pos, s.acc)
+    val k2v = s.vel.copy()
+    stage(s, x0, v0, k2v, s.acc, half, dx, dv, 1.0 / 3.0 * dt)
+    // k3 at the midpoint along k2
+    accelerations(s.gm, s.pos, s.acc)
+    val k3v = s.vel.copy()
+    stage(s, x0, v0, k3v, s.acc, dt, dx, dv, 1.0 / 3.0 * dt)
+    // k4 at the end along k3
+    accelerations(s.gm, s.pos, s.acc)
+    var x = s.pos.view()
+    var v = s.vel.view()
+    for i in 0..<n
+        dx[i] = dx[i] + v[i] * (1.0 / 6.0 * dt)
+        dv[i] = dv[i] + s.acc[i] * (1.0 / 6.0 * dt)
+        x[i] = x0[i] + dx[i]
+        v[i] = v0[i] + dv[i]
+    accelerations(s.gm, s.pos, s.acc)
+end rk4
+
+// Accumulate one stage's slope `(kv, ka)` with weight `w`, and move the state to `x0 + h k`, the
+// point the next stage is evaluated at.
+private stage(s: System, x0: Buf[Vec3], v0: Buf[Vec3], kv: Buf[Vec3], ka: Buf[Vec3], h: real,
+              dx: Buf[Vec3], dv: Buf[Vec3], w: real)
+    for i in 0..<s.count()
+        val ki = kv[i]
+        val ai = ka[i]
+        dx[i] = dx[i] + ki * w
+        dv[i] = dv[i] + ai * w
+        s.pos[i] = x0[i] + ki * h
+        s.vel[i] = v0[i] + ai * h
+end stage
+
+private buf_of(n: usize) -> Buf[Vec3]
+    var b = sysl.buf.buf[Vec3]()
+    for _ in 0..<n
+        b.push(Vec3.zero())
+    b

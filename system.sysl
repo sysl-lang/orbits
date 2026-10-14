@@ -1,0 +1,100 @@
+// The n-body system: each body's gravitational parameter GM, position and velocity, in AU and days.
+//
+// Masses appear only as GM (AU^3/day^2), which is how an ephemeris knows them: G and M separately
+// are known to five digits, their product to eleven. So the energy and angular momentum below are
+// G times the physical ones -- conserved exactly when the physical ones are.
+
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+
+struct System
+    names: Buf[string]
+    gm: Buf[real]
+    pos: Buf[Vec3]
+    vel: Buf[Vec3]
+    /** The accelerations at `pos`, kept current by every integrator so a kick never recomputes them. */
+    acc: Buf[Vec3]
+    /** Julian date (TDB) the system was built at; integrators do not advance it. */
+    t: real
+
+    count(self) -> usize = self.gm.len()
+
+    /** An independent copy: the same state in storage of its own. */
+    copy(self) -> System =
+        System(self.names, self.gm.copy(), self.pos.copy(), self.vel.copy(), self.acc.copy(), self.t)
+
+    /** The index of the body called `name`. */
+    index_of(self, name: string) -> Option[usize]
+        for i in 0..<self.count()
+            if self.names[i] == name then return Some(i)
+        None
+
+    /** G times the total energy: kinetic plus the pairwise potential. */
+    energy(self) -> real
+        val n = self.count()
+        var kinetic = 0.0
+        var potential = 0.0
+
+        for i in 0..<n
+            kinetic += 0.5 * self.gm[i] * self.vel[i].norm2()
+            for j in i + 1..<n
+                potential -= self.gm[i] * self.gm[j] / (self.pos[j] - self.pos[i]).norm()
+
+        kinetic + potential
+    end energy
+
+    /** G times the total angular momentum about the origin. */
+    angular_momentum(self) -> Vec3
+        var l = Vec3.zero()
+
+        for i in 0..<self.count()
+            l = l + self.gm[i] * self.pos[i].cross(self.vel[i])
+        l
+
+    /** The barycentre's position and velocity. */
+    barycentre(self) -> (Vec3, Vec3)
+        var m = 0.0
+        var r = Vec3.zero()
+        var v = Vec3.zero()
+
+        for i in 0..<self.count()
+            m += self.gm[i]
+            r = r + self.gm[i] * self.pos[i]
+            v = v + self.gm[i] * self.vel[i]
+        (r * (1.0 / m), v * (1.0 / m))
+    end barycentre
+
+/** A system built from parallel lists, its accelerations computed once. */
+system(names: Buf[string], gm: Buf[real], pos: Buf[Vec3], vel: Buf[Vec3], t: real) -> System
+    var acc = buf[Vec3]()
+
+    for _ in 0..<gm.len()
+        acc.push(Vec3.zero())
+    accelerations(gm, pos, acc)
+    System(names, gm, pos, vel, acc, t)
+
+/** Newtonian gravity, every pair once: `acc[i]` is the sum over `j` of `GM_j d / |d|^3`.
+ *
+ * This loop is the program's whole cost. Each pair's `1/r^3` is computed once and applied to both
+ * bodies with opposite signs, which halves the square roots and keeps momentum conserved to rounding.
+ */
+accelerations(gm: Buf[real], pos: Buf[Vec3], acc: Buf[Vec3])
+    val n = gm.len()
+    val p = pos.view()
+    val m = gm.view()
+    var a = acc.view()
+
+    for i in 0..<n
+        a[i] = Vec3.zero()
+
+    for i in 0..<n
+        val pi = p[i]
+        var ai = a[i]
+        for j in i + 1..<n
+            val d = p[j] - pi
+            val r2 = d.norm2()
+            val inv = 1.0 / (r2 * r2.sqrt())
+            ai = ai + d * (m[j] * inv)
+            a[j] = a[j] - d * (m[i] * inv)
+        a[i] = ai
+end accelerations

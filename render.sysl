@@ -1,0 +1,126 @@
+// The orbits as 3D tracks seen through a perspective camera, drawn by cairo into a PNG.
+//
+// The camera's orientation is a quaternion: it looks down its own -z axis with +y up, and a point is
+// carried into the camera's frame by the inverse rotation, `q* (p - eye) q`. `look_at_origin` builds
+// the orientation as a yaw about the ecliptic pole followed by a tilt, which is the composition a
+// camera orbiting the Sun needs and which Euler angles would need a convention to say.
+
+import sh.sysl.cairo.{Format, Surface, image_surface, context}
+import sh.sysl.quaternion.Quaternion
+import sysl.buf.{Buf, buf}
+import sysl.math.Float
+
+struct Camera
+    orientation: Quaternion[real]
+    eye: Vec3
+    /** Focal length in pixels, and the pixel the optical axis lands on. */
+    focal: real
+    cx: real
+    cy: real
+
+    /** The pixel `p` lands on, or `None` when it is behind the camera. */
+    project(self, p: Vec3) -> Option[(real, real)]
+        val c = Vec3.of(self.orientation.conjugate().rotate((p - self.eye).arr()))
+        if c.z >= 0.0 then return None
+        Some((self.cx + self.focal * c.x / -c.z, self.cy - self.focal * c.y / -c.z))
+
+/** A camera `dist` AU from the origin, looking at it: `azimuth` around the ecliptic pole from the -y
+ * axis, `elevation` above the ecliptic (pi/2 is straight down from above).
+ */
+look_at_origin(azimuth: real, elevation: real, dist: real, focal: real, cx: real, cy: real) -> Camera
+    val q = Quaternion.from_axis_angle([0.0, 0.0, 1.0], azimuth) *
+        Quaternion.from_axis_angle([1.0, 0.0, 0.0], 0.5 * real.pi() - elevation)
+    Camera(q, Vec3.of(q.rotate([0.0, 0.0, dist])), focal, cx, cy)
+
+/** Each body's colour, in `body_names` order. */
+val body_colours: [11][3]real = [
+    [1.0, 0.85, 0.2], [0.7, 0.7, 0.7], [0.95, 0.8, 0.5], [0.3, 0.6, 1.0], [0.8, 0.8, 0.8],
+    [1.0, 0.4, 0.25], [0.9, 0.65, 0.4], [0.9, 0.8, 0.55], [0.55, 0.85, 0.9], [0.35, 0.5, 1.0],
+    [0.75, 0.6, 0.55]]
+
+/** Each body's orbital period in days, which is how much of its track is drawn (the Sun's and the
+ * Moon's are not drawn).
+ */
+val body_periods: [11]real = [0.0, 88.0, 225.0, 365.25, 0.0, 687.0, 4333.0, 10759.0, 30687.0, 60190.0, 90560.0]
+
+val background: [3]real = [0.04, 0.05, 0.08]
+
+/** The image is two panels of `panel` pixels square: the inner planets and the outer ones. */
+const panel: int = 600
+
+/** The cameras of the two panels: the same direction, a different distance. */
+inner_camera() -> Camera = look_at_origin(0.5, 0.6, 6.0, 900.0, 0.5 * real(panel), 0.5 * real(panel))
+outer_camera() -> Camera = look_at_origin(0.5, 0.6, 140.0, 900.0, 1.5 * real(panel), 0.5 * real(panel))
+
+/** Whether panel `k` draws body `b`: the Sun in both, Mercury to Mars in the first, Jupiter to Pluto
+ * in the second.
+ */
+in_panel(k: int, b: usize) -> bool = b == 0 || (if k == 0 then b <= 5 else b >= 6)
+
+/** Every drawn body's positions along one orbit, sampled about 500 times, by integrating `s` with
+ * Yoshida at one day a step. `tracks[b]` is empty for a body that is not drawn.
+ */
+tracks(s: System) -> Buf[Buf[Vec3]]
+    val n = s.count()
+    var out = buf[Buf[Vec3]]()
+    var longest = 0.0
+
+    for b in 0..<n
+        out.push(buf[Vec3]())
+        longest = if body_periods[b] > longest then body_periods[b] else longest
+
+    val days = int(longest) + 1
+    for day in 0..days
+        for b in 0..<n
+            val period = body_periods[b]
+            val stride = if period > 500.0 then int(period / 500.0) else 1
+            if period > 0.0 && real(day) <= period + real(stride) && day % stride == 0
+                out[b].push(s.pos[b])
+        step(s, 1.0, Integrator.Yoshida)
+    out
+end tracks
+
+/** The picture of `s`: both panels, every track, and each body where it is at `s`'s epoch. */
+draw(s: System) -> &Surface
+    val surface = image_surface(Format.Argb32, 2 * panel, panel)
+    val cr = context(surface)
+    val cams = [inner_camera(), outer_camera()]
+
+    cr.set_source_rgb(background[0], background[1], background[2])
+    cr.paint()
+
+    val now = s.copy()
+    val paths = tracks(s.copy())
+
+    for k in 0..<2
+        val cam = cams[k]
+        cr.set_line_width(1.5)
+        for b in 0..<now.count()
+            if !in_panel(k, b) then continue
+            val c = body_colours[b]
+            cr.set_source_rgb(c[0], c[1], c[2])
+            var pen_down = false
+            for p in paths[b]
+                cam.project(p) match
+                    Some((x, y)) ->
+                        if pen_down then cr.line_to(x, y) else cr.move_to(x, y)
+                        pen_down = true
+                    None -> pen_down = false
+            cr.stroke()
+
+        for b in 0..<now.count()
+            if b == 4 || !in_panel(k, b) then continue
+            val c = body_colours[b]
+            cam.project(now.pos[b]) match
+                Some((x, y)) ->
+                    cr.set_source_rgb(c[0], c[1], c[2])
+                    cr.arc(x, y, if b == 0 then 7.0 else 4.0, 0.0, 2.0 * real.pi())
+                    cr.fill()
+                None -> ()
+    surface.flush()
+    surface
+end draw
+
+/** Draw the J2000 solar system and write it to `file`. */
+render_orbits(file: string)
+    draw(horizons_system(0)).write_png(file)

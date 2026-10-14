@@ -1,0 +1,178 @@
+// A JPL Horizons reply, read: the state vector at one epoch, and whatever the object-data header
+// says about the body's GM and radius. One reader serves both the committed fixtures the catalog is
+// seeded from and a live `orbits add`, so the seed exercises the same code a fetch does.
+//
+// The request is the stage-1 query (barycentric, ecliptic and mean equinox of J2000, AU and AU/day,
+// CSV) with `OBJ_DATA='YES'` so the header comes back too:
+//
+//     https://ssd.jpl.nasa.gov/api/horizons.api?format=text&COMMAND='<name>'&OBJ_DATA='YES'
+//         &MAKE_EPHEM='YES'&EPHEM_TYPE='VECTORS'&CENTER='500@0'&REF_PLANE='ECLIPTIC'
+//         &REF_SYSTEM='ICRF'&VEC_TABLE='2'&OUT_UNITS='AU-D'&CSV_FORMAT='YES'&VEC_LABELS='NO'
+//         &TLIST='<epoch>'
+//
+// A reply with no `$$SOE` table is Horizons declining: either nothing matched, and its own words are
+// the message, or several bodies did, and the matches are listed.
+
+import sh.sysl.curl as curl
+import sh.sysl.curl.c as curl_c
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.text.{Search, contains_fold, from_cstring, join, parse_long, parse_real, real_prefix, split}
+
+/** One body as the catalog stores it. GM is km^3/s^2 (Horizons' unit; zero for a test particle),
+ * the radius km, positions AU and velocities AU/day, barycentric ecliptic J2000.
+ */
+struct Body
+    name: string
+    naif_id: Option[long]
+    gm: real
+    radius: Option[real]
+    parent: Option[string]
+    epoch_jd: real
+    pos: Vec3
+    vel: Vec3
+    source: string
+    fetched_at: string
+
+/** The text after `marker` on the first line holding it, up to `stop` if that follows, trimmed. */
+private after(lines: []const string, marker: string, stop: string) -> Option[string]
+    for line in lines
+        val at = line.index_of(marker) match
+            Some(i) -> i + marker.len
+            None -> continue
+        val rest = line[at..]
+        val end_at = rest.index_of(stop).unwrap_or(rest.len)
+        return Some(rest[0..<end_at].trim())
+    None
+
+/** The number after the first `=` past `from` in `line`, or `None` where Horizons wrote `n.a.`. */
+private number_after(line: string, from: usize) -> Option[real]
+    val eq = line.index_of_byte_from(u8('='), from) match
+        Some(i) -> i
+        None -> return None
+    val (v, used) = real_prefix(line[eq + 1..].bytes)
+    if used == 0 then None else Some(v)
+
+/** GM from the object-data header, in any of the three spellings Horizons uses: `GM= 62.6284` (a
+ * small body), `GM, km^3/s^2 = 4902.800066` and `GM (km^3/s^2) = 42828.375662` (major bodies).
+ * The 1-sigma line beside the last two is not the value.
+ */
+private header_gm(lines: []const string) -> Option[real]
+    for line in lines
+        var from: usize = 0
+        loop
+            val at = line.index_of_from("GM", from) match
+                Some(i) -> i
+                None -> break
+            from = at + 2
+            val next = if from < line.len then line.bytes[from] else u8(' ')
+            if next != u8('=') && next != u8(' ') && next != u8(',') then continue
+            if line[from..].trim_start().starts_with("1-sigma") then continue
+            return number_after(line, from)
+    None
+
+/** The radius from the header: `RAD= 469.7` (a small body) or the first line with "radius" in it
+ * (`Vol. mean radius (km) = 3389.92+-0.04`, `Radius (IAU), km = 1737.4`).
+ */
+private header_radius(lines: []const string) -> Option[real]
+    for line in lines
+        if line.contains("RAD=") || contains_fold(line, "radius")
+            return number_after(line, line.index_of("RAD=").unwrap_or(0))
+    None
+
+/** The match table of an ambiguous reply: the rows between the `----` rule under its heading and
+ * the blank line that ends it, as Horizons printed them.
+ */
+private matches(lines: []const string) -> Buf[string]
+    var out = buf[string]()
+    var inside = false
+
+    for line in lines
+        if !inside
+            inside = line.trim().starts_with("----")
+        else if line.trim().is_empty()
+            break
+        else
+            out.push(line.trim())
+    out
+
+/** What Horizons said between its first and last rule of asterisks, one trimmed line each. */
+private message(lines: []const string) -> string
+    var said = buf[string]()
+    var inside = false
+
+    for line in lines
+        if line.starts_with("*****")
+            if inside then break
+            inside = true
+        else if inside && !line.trim().is_empty()
+            said.push(line.trim())
+    join(said.view(), "\n")
+
+/** `NAME (123)` names NAIF id 123; `1 Ceres (A801 AA)` names none. */
+private naif_of(target: string) -> Option[long]
+    if !target.ends_with(")") then return None
+    val open_at = target.last_index_of("(") match
+        Some(i) -> i
+        None -> return None
+    parse_long(target[open_at + 1..<target.len - 1]).ok()
+
+/** The body `name` from a Horizons reply, its state the table row at Julian date `epoch`. */
+read_reply(text: string, name: string, epoch: real) -> Result[Body, Failure]
+    val lines = split(text, "\n")
+    var soe: Option[usize] = None
+    for k in 0..<lines.len
+        if lines[k].starts_with("$$SOE") then soe = Some(k)
+
+    if soe.is_none()
+        val listed = matches(lines)
+        if listed.len() > 0
+            return Err(Failure(s"Horizons: \"$name\" matches ${listed.len()} bodies; name one by its ID#", listed))
+        return Err(failure(message(lines)))
+
+    var row: Option[[]string] = None
+    for line in lines[soe.unwrap() + 1..]
+        if line.starts_with("$$EOE") then break
+        val f = split(line, ",")
+        if f.len >= 8 && parse_real(f[0].trim())? == epoch
+            row = Some(f)
+    val f = row match
+        Some(f) -> f
+        None -> return Err(failure(s"Horizons' table for \"$name\" has no row at JD $epoch"))
+
+    var v: [6]real = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for k in 0..<6
+        v[k] = parse_real(f[k + 2].trim())?
+
+    val header = lines[0..<soe.unwrap()]
+    val target = after(header, "Target body name:", "{").unwrap_or(name)
+    val source = after(header, "{source:", "}").unwrap_or("?")
+    val gm = header_gm(header)
+
+    Ok(Body(name, naif_of(target), gm.unwrap_or(0.0), header_radius(header), None, epoch,
+        Vec3(v[0], v[1], v[2]), Vec3(v[3], v[4], v[5]), s"JPL Horizons ($source)",
+        after(header, "API_USER", "Pasadena").unwrap_or("")))
+end read_reply
+
+/** `s` percent-encoded for a URL query, by libcurl. */
+private escaped(s: string) -> string
+    val p = curl_c.easy_escape(null, as_ptr(s.bytes), i32(s.len))
+    val out = from_cstring(p).unwrap_or("")
+    curl_c.free(p)
+    out
+
+/** The Horizons query for `command` at Julian date `epoch`. */
+horizons_url(command: string, epoch: real) -> string =
+    "https://ssd.jpl.nasa.gov/api/horizons.api?format=text&COMMAND=" + escaped(s"'$command'") +
+        "&OBJ_DATA='YES'&MAKE_EPHEM='YES'&EPHEM_TYPE='VECTORS'&CENTER='500@0'&REF_PLANE='ECLIPTIC'" +
+        "&REF_SYSTEM='ICRF'&VEC_TABLE='2'&OUT_UNITS='AU-D'&CSV_FORMAT='YES'&VEC_LABELS='NO'" +
+        s"&TLIST='$epoch'"
+
+/** Ask Horizons for `command` (a name, an ID#, or `Ceres;` for the small-body record) at `epoch`. */
+fetch_body(command: string, epoch: real) -> Result[Body, Failure]
+    curl.init()?
+    val r = curl.client("orbits/0.1")?.get(horizons_url(command, epoch))?
+    if !r.ok() then return Err(failure(s"Horizons answered HTTP ${r.status}: ${r.text()}"))
+
+    val name = if command.ends_with(";") then command[0..<command.len - 1] else command
+    read_reply(r.text(), name, epoch)

@@ -21,9 +21,17 @@ requires {
 // `quaternion` is unreleased, so it is a sibling checkout (`git clone` sysl-lang/quaternion beside
 // this repository) rather than a coordinate; it becomes `{ git = ..., version = "0.1.0" }` when it is
 // tagged.
+//
+// `duckdb` is unreleased too, and is a sibling checkout the same way. DuckDB ships no `.pc` file, so
+// every build passes its directories:
+//
+//     sysl test . --include-path duckdb=/opt/homebrew/include --link-path /opt/homebrew/lib
 dependencies {
   quaternion { path = "../quaternion" }
+  duckdb     { path = "../duckdb" }
   cairo      { git = "github.com/sysl-lang/cairo", version = "0.3.3" }
+  sqlite3    { git = "github.com/sysl-lang/sqlite3", version = "0.7.0" }
+  curl       { git = "github.com/sysl-lang/curl", version = "0.1.2" }
 }
 
 // The tests decode the PNG cairo writes with a decoder that is not cairo's.

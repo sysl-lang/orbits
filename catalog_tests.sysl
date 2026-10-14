@@ -1,0 +1,284 @@
+@tests
+
+// The catalog, `orbits add`, the small-body import and the trajectories, against oracles outside
+// the code under test:
+//
+// - **the stage-1 system** (`horizons_system`, typed in from the same Horizons replies) for the seed,
+//   which must reproduce it to the bit, and so reproduce every stage-1 result;
+// - **recorded Horizons replies** (`fixtures/add/`) for `add`, its numbers checked against the text;
+// - **the SBDB JSON itself** for the import, and **Horizons** for elements turned into a state;
+// - **a closest approach computed in sysl** over the same samples, for the one DuckDB computes;
+// - **the `duckdb` CLI** for DuckDB's error sentences.
+//
+// The replies in `fixtures/add/` were fetched on 2026-10-14 with the query in `reply.sysl`:
+// `ceres.txt` is COMMAND='Ceres;', `mars.txt` 'Mars', `xyzzyq.txt` 'Xyzzyq', all at TLIST='2451545.0';
+// `ceres-heliocentric.txt` is 'Ceres;' with CENTER='500@10' (the Sun), OBJ_DATA='NO' and
+// TLIST='2461200.5', the SBDB elements' epoch.
+
+import sh.sysl.duckdb as duck
+import sysl.FloatBits
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_dir_all, read_text}
+import sysl.math.{Float, max}
+import sysl.text.{Search, parse_int}
+
+private const deg: real = 0.017453292519943295
+
+private seeded() -> &sh.sysl.sqlite.Db
+    val db = open_catalog(":memory:").unwrap()
+    seed(db, "fixtures/horizons").unwrap()
+    db
+
+private reply(file: string, name: string, epoch: real) -> Result[Body, Failure] =
+    read_reply(read_text(s"fixtures/add/$file").unwrap(), name, epoch)
+
+private same(a: Vec3, b: Vec3) -> bool =
+    a.x.bits() == b.x.bits() && a.y.bits() == b.y.bits() && a.z.bits() == b.z.bits()
+
+// -- the catalog -------------------------------------------------------------------------------------
+
+@test("a body goes into the catalog and comes back with every column, NULLs included")
+catalog_round_trip()
+    val db = open_catalog(":memory:").unwrap()
+    val full = Body("Ceres", Some(2000001), 62.6284, Some(469.7), Some("Sun"), 2451545.0,
+        Vec3(-2.386464885077254, 0.7926900413975719, 0.4632118700964067),
+        Vec3(-0.003578849812842602, -0.01059335553156894, 0.0003337592763237325), "JPL Horizons (JPL#48)", "then")
+    val bare = Body("dust", None, 0.0, None, None, 2451545.0, Vec3(1.0, 2.0, 3.0), Vec3(0.1, 0.2, 0.3), "made up", "")
+    insert(db, full).unwrap()
+    insert(db, bare).unwrap()
+
+    val back = bodies_where(db, "1").unwrap()
+    assert_eq(back.len(), 2)
+    val c = back[0]
+    assert(c.name == "Ceres" && c.naif_id == Some(2000001) && c.gm == 62.6284 && c.radius == Some(469.7), "scalars")
+    assert(c.parent == Some("Sun") && c.epoch_jd == 2451545.0 && c.source == full.source && c.fetched_at == "then", "text")
+    assert(same(c.pos, full.pos) && same(c.vel, full.vel), "the state, to the bit")
+    val d = back[1]
+    assert(d.name == "dust" && d.naif_id.is_none() && d.radius.is_none() && d.parent.is_none(), "NULLs come back as None")
+
+    insert(db, Body("dust", None, 1.0, None, None, 2451545.0, Vec3.zero(), Vec3.zero(), "again", "")).unwrap()
+    assert_eq(bodies_where(db, "1").unwrap().len(), 2)
+    assert_eq(bodies_where(db, "name = 'dust'").unwrap()[0].gm, 1.0)
+
+@test("the seeded catalog is the stage-1 system to the bit, and so integrates to the same answer")
+seeded_system()
+    val s = system_of(bodies_where(seeded(), "1").unwrap()).unwrap()
+    val truth = horizons_system(0)
+
+    assert_eq(s.count(), 11)
+    assert_eq(s.t, 2451545.0)
+    for b in 0..<s.count()
+        assert(s.names[b] == truth.names[b], s"name $b")
+        assert(s.gm[b].bits() == truth.gm[b].bits(), s"GM of ${s.names[b]}")
+        assert(same(s.pos[b], truth.pos[b]) && same(s.vel[b], truth.vel[b]), s"state of ${s.names[b]}")
+
+    advance(s, 0.05, 600, Integrator.Yoshida)
+    advance(truth, 0.05, 600, Integrator.Yoshida)
+    val horizons = horizons_system(1)
+    var err = 0.0
+    for b in 0..<s.count()
+        assert(same(s.pos[b], truth.pos[b]), s"${s.names[b]} 30 days on, to the bit")
+        err = max(err, (s.pos[b] - horizons.pos[b]).norm())
+    assert(err < 2e-7, "and so within stage 1's 2e-7 AU of Horizons 30 days on")
+
+@test("a system is chosen from the catalog by name or by SQL")
+choosing_bodies()
+    val db = seeded()
+    val named = bodies_named(db, ["Moon", "Sun", "Earth"]).unwrap()
+    assert(named.len() == 3 && named[0].name == "Sun" && named[1].name == "Earth" && named[2].name == "Moon",
+        "catalog order, whatever order they were asked in")
+
+    val giants = bodies_where(db, "parent = 'Sun' AND gm > 1e7").unwrap()
+    assert(giants.len() == 2 && giants[0].name == "Jupiter" && giants[1].name == "Saturn", "Jupiter and Saturn")
+    assert_eq(bodies_where(db, "parent = 'Earth'").unwrap()[0].name, "Moon")
+    assert_eq(catalog_epoch(db).unwrap(), 2451545.0)
+
+    assert_eq(str(bodies_named(db, ["Sun", "Vulcan"]).unwrap_err()), "the catalog has no body called \"Vulcan\"")
+    assert(str(bodies_where(db, "no_such_column = 1").unwrap_err()).starts_with("SQLite: no such column: no_such_column"),
+        "SQLite's own sentence")
+    assert_eq(str(system_of(buf[Body]()).unwrap_err()), "no bodies selected")
+    assert_eq(str(catalog_epoch(open_catalog(":memory:").unwrap()).unwrap_err()),
+        "the catalog has no Sun; run `orbits seed` first")
+
+    var mixed = bodies_named(db, ["Sun"]).unwrap()
+    val e = mixed[0]
+    mixed.push(Body("late", None, 0.0, None, None, 2451546.0, e.pos, e.vel, "", ""))
+    assert_eq(str(system_of(mixed).unwrap_err()), "late is at JD 2451546, not the system's 2451545")
+
+// -- orbits add ----------------------------------------------------------------------------------------
+
+@test("add reads a recorded Horizons reply: the state, GM and radius from its header, and the source")
+add_from_fixture()
+    val c = reply("ceres.txt", "Ceres", 2451545.0).unwrap()
+    assert_eq(c.name, "Ceres")
+    assert(same(c.pos, Vec3(-2.386464885077254, 0.7926900413975719, 0.4632118700964067)), "position, as the text")
+    assert(same(c.vel, Vec3(-0.003578849812842602, -0.01059335553156894, 0.0003337592763237325)), "velocity")
+    assert_eq(c.gm, 62.6284)
+    assert(c.radius == Some(469.7) && c.naif_id.is_none(), "RAD=, and no NAIF id in `1 Ceres (A801 AA)`")
+    assert_eq(c.source, "JPL Horizons (JPL#48)")
+    assert_eq(c.fetched_at, "Wed Oct 14 01:27:49 2026")
+
+    val db = seeded()
+    insert(db, c).unwrap()
+    val s = system_of(bodies_where(db, "1").unwrap()).unwrap()
+    assert(s.count() == 12 && s.names[11] == "Ceres" && s.gm[11] == gm_au(62.6284), "Ceres joins the system with its GM")
+    assert_eq(str(reply("ceres.txt", "Ceres", 2451546.0).unwrap_err()), "Horizons' table for \"Ceres\" has no row at JD 2451546")
+
+@test("add reads GM and the radius in each spelling Horizons uses, and n.a. as no GM")
+add_header_spellings()
+    val row = "$$SOE\n2451545.000000000, A.D. 2000-Jan-01 12:00:00.0000, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,\n$$EOE\n"
+    val moon = read_reply("  Radius (IAU), km      = 1737.4           GM, km^3/s^2          = 4902.800066\n" +
+        "  Density, g/cm^3       =    3.3437        GM 1-sigma, km^3/s^2  =  +-0.0001\n" +
+        "Target body name: Moon (301)                      {source: DE441}\n" + row, "Moon", 2451545.0).unwrap()
+    assert(moon.gm == 4902.800066 && moon.radius == Some(1737.4) && moon.naif_id == Some(301), "the Moon's header")
+    assert(same(moon.pos, Vec3(1.0, 2.0, 3.0)) && same(moon.vel, Vec3(4.0, 5.0, 6.0)), "and its row")
+
+    val mars = read_reply("  Vol. mean radius (km) = 3389.92+-0.04   Density (g/cm^3)      =  3.933(5+-4)\n" +
+        "  GM (km^3/s^2)         = 42828.375662    Mass ratio (Sun/Mars) = 3098703.59\n" + row, "Mars", 2451545.0).unwrap()
+    assert(mars.gm == 42828.375662 && mars.radius == Some(3389.92), "Mars's header")
+
+    val apophis = read_reply("   GM= n.a.                RAD= .170               ROTPER= 30.56\n" + row, "Apophis", 2451545.0).unwrap()
+    assert(apophis.gm == 0.0 && apophis.radius == Some(0.17), "no GM is a test particle")
+
+@test("add of an unknown name fails with Horizons' own message")
+add_unknown()
+    assert_eq(str(reply("xyzzyq.txt", "Xyzzyq", 2451545.0).unwrap_err()),
+        "JPL/DASTCOM            Small-body Index Search Results     2026-Oct-14 01:27:36\n" +
+        "Comet AND asteroid index search:\nNAME = Xyzzyq;\nMatching small-bodies:\nNo matches found.")
+
+@test("add of an ambiguous name lists the matches")
+add_ambiguous()
+    val e = reply("mars.txt", "Mars", 2451545.0).unwrap_err()
+    assert_eq(e.message, "Horizons: \"Mars\" matches 10 bodies; name one by its ID#")
+    assert_eq(e.matches.len(), 10)
+    assert_eq(e.matches[0], "4  Mars Barycenter")
+    assert_eq(e.matches[1], "499  Mars")
+    assert_eq(e.matches[9], "-168  Mars2020 (spacecraft)              2020-052A    Ingenuity Perseveran")
+    assert(str(e).starts_with("Horizons: \"Mars\" matches 10 bodies; name one by its ID#\n    4  Mars Barycenter\n    499  Mars\n"),
+        "and shows them one to a line")
+
+@test("the Horizons query escapes the command, and asks for the epoch")
+add_url()
+    val url = horizons_url("Ceres;", 2451545.0)
+    assert(url.starts_with("https://ssd.jpl.nasa.gov/api/horizons.api?format=text&COMMAND=%27Ceres%3B%27&OBJ_DATA='YES'"),
+        "the name percent-encoded, quotes and semicolon included")
+    assert(url.contains("&CENTER='500@0'&REF_PLANE='ECLIPTIC'"), "the frame")
+    assert(url.ends_with("&TLIST='2451545'"), "the epoch")
+
+// -- small bodies --------------------------------------------------------------------------------------
+
+private sbdb() -> &duck.Connection
+    val con = duck.open().unwrap().connect().unwrap()
+    assert_eq(import_sbdb(con, "fixtures/sbdb/sample.json").unwrap(), 1000)
+    con
+
+@test("the SBDB sample imports in one read_json: 1000 rows, Ceres's elements as the JSON has them")
+smallbody_import()
+    val con = sbdb()
+    val ceres = small_bodies(con, "SELECT * FROM sbdb WHERE spkid = 20000001").unwrap()
+    assert_eq(ceres.len(), 1)
+    val c = ceres[0]
+    assert(c.name == "1 Ceres (A801 AA)" && c.spkid == 20000001 && c.epoch == 2461200.5, "name, id, epoch")
+    val el = c.elements
+    assert(el.a == 2.765552595034094 && el.e == 0.07969229514816586, "a and e, exactly as the JSON's text")
+    assert(el.i == 10.58802780183462 * deg && el.raan == 80.24862682043221 * deg, "i and the node")
+    assert(el.argp == 73.29421453021587 * deg && el.m == 274.4193463761342 * deg, "periapsis and mean anomaly")
+    assert(c.gm == Some(62.6284) && c.diameter == Some(939.4), "GM and diameter")
+
+    val juno = small_bodies(con, "SELECT * FROM sbdb WHERE name = 'Juno'").unwrap()[0]
+    assert(juno.gm.is_none() && juno.diameter == Some(246.596), "Juno has no GM: NULL, not zero")
+    val inner = parse_int(query_text(con, "SELECT count(*) FROM sbdb WHERE a < 2.0").unwrap()[1][0]).unwrap()
+    assert(inner > 0 && small_bodies(con, "SELECT * FROM sbdb WHERE a < 2.0").unwrap().len() == usize(inner),
+        "a query selects as many as DuckDB counts")
+
+    assert(str(import_sbdb(con, "fixtures/sbdb/missing.json").unwrap_err()).starts_with("DuckDB: IO Error: "),
+        "a missing file is DuckDB's own sentence")
+    assert(str(small_bodies(con, "SELECT 1 AS a").unwrap_err()).starts_with("DuckDB: Binder Error: "),
+        "a query without the sbdb columns is DuckDB's own sentence")
+
+@test("Ceres's SBDB elements give the state Horizons has at their epoch, within 5e-8 AU")
+elements_to_state()
+    val c = small_bodies(sbdb(), "SELECT * FROM sbdb WHERE spkid = 20000001").unwrap()[0]
+    val truth = reply("ceres-heliocentric.txt", "Ceres", 2461200.5).unwrap()
+    val (r, v) = c.heliocentric(2461200.5)
+
+    // The elements are printed to 16 digits and Horizons' heliocentric state is the Sun's own
+    // centre, not the barycentre the elements' two-body problem is about; the two agree to
+    // 2.7e-8 AU (4 km) and 1.0e-10 AU/day, which numpy computes from the same numbers.
+    assert((r - truth.pos).norm() < 5e-8, "position within 5e-8 AU")
+    assert((v - truth.vel).norm() < 5e-10, "velocity within 5e-10 AU/day")
+
+@test("add --query puts the selected small bodies in the catalog, massless unless SBDB has a GM")
+add_query()
+    val db = seeded()
+    val t = catalog_epoch(db).unwrap()
+    val sun = bodies_named(db, ["Sun"]).unwrap()[0]
+    val chosen = small_bodies(sbdb(), "SELECT * FROM sbdb WHERE spkid <= 20000004").unwrap()
+    for b in chosen.view()
+        insert(db, small_body_row(b, t, sun)).unwrap()
+
+    val s = system_of(bodies_where(db, "1").unwrap()).unwrap()
+    assert_eq(s.count(), 15)
+    assert(s.names[11] == "1 Ceres (A801 AA)" && s.gm[11] == gm_au(62.6284), "Ceres has a GM")
+    assert(s.names[13] == "3 Juno (A804 RA)" && s.gm[13] == 0.0, "Juno is a test particle")
+
+    val (r, v) = chosen[0].heliocentric(t)
+    assert(same(s.pos[11], r + sun.pos) && same(s.vel[11], v + sun.vel), "barycentric: the Sun's state added")
+    val juno = bodies_where(db, "name = '3 Juno (A804 RA)'").unwrap()[0]
+    assert(juno.naif_id == Some(20000003) && juno.radius == Some(123.298) && juno.parent == Some("Sun"), "its row")
+
+    val e = s.energy()
+    advance(s, 0.5, 200, Integrator.Yoshida)
+    assert(((s.energy() - e) / e).abs() < 1e-9, "and the system integrates")
+
+// -- trajectories --------------------------------------------------------------------------------------
+
+private earth_moon() -> System = system_of(bodies_named(seeded(), ["Sun", "Earth", "Moon"]).unwrap()).unwrap()
+
+@test("a recorded trajectory's closest approach in SQL is the one computed in sysl")
+closest_approach()
+    val con = duck.open().unwrap().connect().unwrap()
+    val rows = record(con, earth_moon(), 0.05, 1200, 4, Integrator.Yoshida).unwrap()
+    assert_eq(rows, u64(301 * 3))
+
+    val s = earth_moon()
+    var best = real.infinity
+    var when = 0.0
+    for k in 0..<1201
+        if k % 4 == 0
+            val d = (s.pos[1] - s.pos[2]).norm()
+            if d < best
+                best = d
+                when = s.t + real(k) * 0.05
+        if k < 1200 then step(s, 0.05, Integrator.Yoshida)
+
+    val t0 = s.t
+    val got = query_text(con, closest_approach_sql("Earth", "Moon", t0, t0 + 60.0)).unwrap()
+    assert(got[0][0] == "t" && got[0][1] == "d", "the columns")
+    assert_eq(got[1][0], str(when))
+    assert_eq(got[1][1], str(best))
+    assert(best > 0.0023 && best < 0.0025, "the Moon's perigee, about 360,000 km")
+
+@test("the trajectory exports to Parquet and reads back the same")
+parquet_round_trip()
+    val con = duck.open().unwrap().connect().unwrap()
+    record(con, earth_moon(), 0.1, 100, 10, Integrator.Leapfrog).unwrap()
+    make_dir_all("target").unwrap()
+    export_parquet(con, "target/orbits-test-trajectory.parquet").unwrap()
+
+    val from_table = query_text(con, "SELECT * FROM trajectory ORDER BY t, body").unwrap()
+    val from_file = query_text(con, "SELECT * FROM read_parquet('target/orbits-test-trajectory.parquet') ORDER BY t, body").unwrap()
+    assert_eq(from_file.len(), 34)
+    for k in 0..<from_table.len()
+        for c in 0..<from_table[k].len()
+            assert(from_file[k][c] == from_table[k][c], s"row $k column $c")
+
+@test("query answers any SQL as text, and DuckDB's own sentence for bad SQL")
+query_errors()
+    val con = duck.open().unwrap().connect().unwrap()
+    val got = query_text(con, "SELECT 1 AS one, NULL AS nothing, 'x' AS s").unwrap()
+    assert(got[0][0] == "one" && got[1][0] == "1" && got[1][1] == "NULL" && got[1][2] == "x", "values as text")
+    assert_eq(str(query_text(con, "SELEC 1").unwrap_err()),
+        "DuckDB: Parser Error: syntax error at or near \"SELEC\"\n\nLINE 1: SELEC 1\n        ^")
+    assert_eq(str(query_text(con, "SELECT nothing FROM trajectory").unwrap_err()),
+        "DuckDB: Catalog Error: Table with name trajectory does not exist!\nDid you mean \"sqlite_master\"?\n\nLINE 1: SELECT nothing FROM trajectory\n                            ^")

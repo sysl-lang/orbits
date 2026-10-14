@@ -1,23 +1,110 @@
-// `orbits` -- integrate the solar system from the J2000 epoch and draw it.
+// `orbits` -- integrate the solar system from the J2000 epoch and draw it, keep a catalog of bodies
+// to integrate, and record and query trajectories.
 //
-//     orbits                  render orbits.png: every orbit's track, seen from above the ecliptic
-//     orbits --compare        print each body's distance from Horizons at +30 d, +1 y and +10 y
-//     orbits --bench STEPS    time STEPS Yoshida steps of the 11-body system (bench/force.c is C's)
+//     orbits                          render orbits.png: every orbit's track, seen from above the ecliptic
+//     orbits --compare                print each body's distance from Horizons at +30 d, +1 y and +10 y
+//     orbits --bench STEPS            time STEPS Yoshida steps of the 11-body system (bench/force.c is C's)
+//
+//     orbits seed                     make the catalog (orbits.db) from fixtures/horizons
+//     orbits add NAME                 fetch NAME from JPL Horizons at the catalog epoch and insert it
+//     orbits add --query SQL          insert the small bodies SQL selects from the sbdb table
+//     orbits import FILE|URL          import an SBDB query reply into orbits.duckdb as the sbdb table
+//     orbits simulate DAYS [--dt D] [--every K] [--bodies A,B,..|--where SQL] [--parquet FILE]
+//                                     integrate the catalog's bodies, recording into orbits.duckdb
+//     orbits query SQL                run SQL over orbits.duckdb and print the answer as CSV
 
+import sh.sysl.duckdb as duck
+import sysl.buf.{Buf, buf}
 import sysl.math.Float
-import sysl.text.parse_int
+import sysl.text.{join, parse_int, parse_real, split}
 import sysl.time.monotonic
 
-main(args: []string)
+private val catalog_file: string = "orbits.db"
+private val duck_file: string = "orbits.duckdb"
+
+main(args: []string) -> Result[unit, Failure]
     val cmd = if args.len > 1 then args[1] else ""
 
-    if cmd == "--compare"
-        compare()
-    else if cmd == "--bench"
-        bench(if args.len > 2 then parse_int(args[2]).expect("a step count") else 200000)
+    cmd match
+        "--compare" -> Ok(compare())
+        "--bench" -> Ok(bench(if args.len > 2 then parse_int(args[2]).expect("a step count") else 200000))
+        "seed" -> seed_command()
+        "add" -> add_command(args[2..])
+        "import" -> import_command(args[2..])
+        "simulate" -> simulate_command(args[2..])
+        "query" -> query_command(args[2..])
+        _ ->
+            render_orbits("orbits.png")
+            print("wrote orbits.png")
+            Ok(())
+
+private seed_command() -> Result[unit, Failure]
+    seed(open_catalog(catalog_file)?, "fixtures/horizons")?
+    print(s"seeded $catalog_file with the 11 stage-1 bodies")
+    Ok(())
+
+private add_command(rest: []string) -> Result[unit, Failure]
+    if rest.len == 0 then return Err(failure("add what? `orbits add NAME` or `orbits add --query SQL`"))
+    val db = open_catalog(catalog_file)?
+    val t = catalog_epoch(db)?
+
+    if rest[0] == "--query"
+        if rest.len < 2 then return Err(failure("--query wants the SQL"))
+        val sun = bodies_named(db, ["Sun"])?[0]
+        val con = duck.open(duck_file)?.connect()?
+        val chosen = small_bodies(con, rest[1])?
+        db.begin()?
+        for b in chosen.view()
+            insert(db, small_body_row(b, t, sun))?
+        db.commit()?
+        print(s"added ${chosen.len()} small bodies")
     else
-        render_orbits("orbits.png")
-        print("wrote orbits.png")
+        val body = fetch_body(rest[0], t)?
+        insert(db, body)?
+        print(s"added ${body.name}, GM ${body.gm} km^3/s^2")
+    Ok(())
+end add_command
+
+private import_command(rest: []string) -> Result[unit, Failure]
+    if rest.len == 0 then return Err(failure("import what? a file or URL holding an SBDB query reply"))
+    val n = import_sbdb(duck.open(duck_file)?.connect()?, rest[0])?
+    print(s"imported $n small bodies into $duck_file")
+    Ok(())
+
+/** The value after `flag` in `rest`, if it is there. */
+private option(rest: []string, flag: string) -> Option[string]
+    for k in 0..<rest.len
+        if rest[k] == flag && k + 1 < rest.len then return Some(rest[k + 1])
+    None
+
+private simulate_command(rest: []string) -> Result[unit, Failure]
+    if rest.len == 0 then return Err(failure("simulate for how many days?"))
+    val days = parse_real(rest[0])?
+    val dt = parse_real(option(rest, "--dt").unwrap_or("0.05"))?
+    val every = parse_int(option(rest, "--every").unwrap_or("20"))?
+    val db = open_catalog(catalog_file)?
+
+    val bodies = option(rest, "--bodies") match
+        Some(list) -> bodies_named(db, split(list, ","))?
+        None -> bodies_where(db, option(rest, "--where").unwrap_or("1"))?
+    val s = system_of(bodies)?
+    val con = duck.open(duck_file)?.connect()?
+    val rows = record(con, s, dt, int((days / dt).round()), every, Integrator.Yoshida)?
+    print(s"recorded $rows rows of ${s.count()} bodies into $duck_file")
+
+    option(rest, "--parquet") match
+        Some(file) ->
+            export_parquet(con, file)?
+            print(s"wrote $file")
+        None -> ()
+    Ok(())
+end simulate_command
+
+private query_command(rest: []string) -> Result[unit, Failure]
+    if rest.len == 0 then return Err(failure("query what?"))
+    for row in query_text(duck.open(duck_file)?.connect()?, rest[0])?.view()
+        print(join(row.view(), ","))
+    Ok(())
 
 /** How far each body is from where Horizons has it, after integrating from the epoch at `dt`. */
 compare()

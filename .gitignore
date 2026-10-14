@@ -2,3 +2,6 @@ target/
 .sysl/
 *.syslib
 /orbits
+orbits.db
+orbits.duckdb
+*.parquet

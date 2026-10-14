@@ -1,0 +1,71 @@
+// Trajectories in DuckDB: the simulator appends `(t, body, x, y, z)` rows through DuckDB's appender
+// as it integrates, `COPY` writes them to Parquet, and `orbits query` runs any SQL over them --
+// a closest approach is a self-join on `t` and a `min`.
+
+import sh.sysl.duckdb.Connection
+import sysl.buf.{Buf, buf}
+
+/** Make the table `trajectory` if it is not there. */
+trajectory_table(con: &Connection) -> Result[unit, Failure]
+    con.exec("CREATE TABLE IF NOT EXISTS trajectory (t DOUBLE, body VARCHAR, x DOUBLE, y DOUBLE, z DOUBLE)")?
+    Ok(())
+
+/** Integrate `s` for `steps` steps of `dt` days with `how`, appending every body's position at the
+ * start and after every `every` steps; answers the rows appended.
+ */
+record(con: &Connection, s: System, dt: real, steps: int, every: int, how: Integrator) -> Result[u64, Failure]
+    trajectory_table(con)?
+    val app = con.appender("trajectory")?
+    var rows: u64 = 0
+
+    for k in 0..<steps + 1
+        if k % every == 0
+            val t = s.t + real(k) * dt
+            for b in 0..<s.count()
+                app.add_f64(t)?
+                app.add_text(s.names[b])?
+                app.add_f64(s.pos[b].x)?
+                app.add_f64(s.pos[b].y)?
+                app.add_f64(s.pos[b].z)?
+                app.end_row()?
+                rows += 1
+        if k < steps then step(s, dt, how)
+    app.flush()?
+    Ok(rows)
+end record
+
+/** Write the table `trajectory` to the Parquet file `file`. */
+export_parquet(con: &Connection, file: string) -> Result[unit, Failure]
+    con.exec(s"COPY trajectory TO ${sql_text(file)} (FORMAT parquet)")?
+    Ok(())
+
+/** The closest approach of bodies `a` and `b` over the recorded `t` in `[from, to]`, as SQL. */
+closest_approach_sql(a: string, b: string, from: real, to: real) -> string =
+    "SELECT p.t, sqrt((p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y) + (p.z - q.z) * (p.z - q.z)) AS d " +
+        s"FROM trajectory p JOIN trajectory q ON p.t = q.t WHERE p.body = ${sql_text(a)} AND q.body = ${sql_text(b)} " +
+        s"AND p.t BETWEEN $from AND $to ORDER BY d, p.t LIMIT 1"
+
+/** A query's answer as text: the column names, then each row, every value cast to VARCHAR by DuckDB
+ * (`NULL` where it is null). The SQL is prepared on its own first, so a mistake in it is reported
+ * against the text that was written rather than the cast wrapped around it.
+ */
+query_text(con: &Connection, sql: string) -> Result[Buf[Buf[string]], Failure]
+    con.prepare(sql)?
+    val r = con.query(s"SELECT COLUMNS(*)::VARCHAR FROM ($sql) AS answer")?
+    var out = buf[Buf[string]]()
+    var head = buf[string]()
+
+    for c in 0..<r.columns()
+        head.push(r.name(c))
+    out.push(head)
+    loop
+        val ch = r.next() match
+            Some(ch) -> ch
+            None -> break
+        for k in 0..<ch.size()
+            var row = buf[string]()
+            for c in 0..<ch.columns()
+                row.push(ch.column(c).text(k)?.unwrap_or("NULL"))
+            out.push(row)
+    Ok(out)
+end query_text

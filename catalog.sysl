@@ -1,0 +1,126 @@
+// The body catalog: one SQLite table the simulator loads its system from.
+//
+//     bodies(name, naif_id, gm, radius, parent, epoch_jd, x, y, z, vx, vy, vz, source, fetched_at)
+//
+// `gm` is km^3/s^2 as Horizons publishes it (zero for a massless test particle), `radius` km, the
+// state barycentric ecliptic J2000 in AU and AU/day at Julian date (TDB) `epoch_jd`. Every body in a
+// system shares one epoch -- the catalog's, which is the Sun's -- because an integrator starts every
+// body at the same instant. Rows keep their insertion order, so the seeded catalog loads in the
+// stage-1 order: the Sun, the planets, the Moon among them, Pluto.
+
+import sh.sysl.sqlite.{ColumnType, Db, Query, open}
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_text
+import sysl.text.{Search, join}
+
+private val columns: string ="name, naif_id, gm, radius, parent, epoch_jd, x, y, z, vx, vy, vz, source, fetched_at"
+
+/** The catalog in `file` (`":memory:"` for one that lasts as long as the handle), its table made if
+ * it is new.
+ */
+open_catalog(file: string) -> Result[&Db, Failure]
+    val db = open(file)?
+    db.exec("CREATE TABLE IF NOT EXISTS bodies (name TEXT PRIMARY KEY, naif_id INTEGER, gm REAL NOT NULL, " +
+        "radius REAL, parent TEXT, epoch_jd REAL NOT NULL, x REAL NOT NULL, y REAL NOT NULL, z REAL NOT NULL, " +
+        "vx REAL NOT NULL, vy REAL NOT NULL, vz REAL NOT NULL, source TEXT NOT NULL, fetched_at TEXT NOT NULL)")?
+    Ok(db)
+
+/** Insert `b`, replacing a body of the same name. */
+insert(db: &Db, b: Body) -> Result[unit, Failure]
+    val q = db.prepare(s"INSERT OR REPLACE INTO bodies ($columns) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")?
+    q.bind_text(1, b.name)?
+    b.naif_id match
+        Some(id) -> q.bind_long(2, id)?
+        None -> q.bind_null(2)?
+    q.bind_real(3, b.gm)?
+    b.radius match
+        Some(r) -> q.bind_real(4, r)?
+        None -> q.bind_null(4)?
+    b.parent match
+        Some(p) -> q.bind_text(5, p)?
+        None -> q.bind_null(5)?
+    q.bind_real(6, b.epoch_jd)?
+    q.bind_real(7, b.pos.x)?
+    q.bind_real(8, b.pos.y)?
+    q.bind_real(9, b.pos.z)?
+    q.bind_real(10, b.vel.x)?
+    q.bind_real(11, b.vel.y)?
+    q.bind_real(12, b.vel.z)?
+    q.bind_text(13, b.source)?
+    q.bind_text(14, b.fetched_at)?
+    q.step()?
+    Ok(())
+end insert
+
+/** The NAIF ids of the stage-1 fixtures, in `body_names` order. */
+private val seed_ids: [11]string = ["10", "199", "299", "399", "301", "4", "5", "6", "7", "8", "9"]
+
+/** Fill the catalog from the committed Horizons replies in `dir` (`fixtures/horizons`), each body's
+ * state the row at the J2000 epoch and its GM DE440's (`body_gm_km`), which the replies leave out.
+ */
+seed(db: &Db, dir: string) -> Result[unit, Failure]
+    db.begin()?
+    for b in 0..<11
+        val text = read_text(s"$dir/b${seed_ids[b]}.txt")?
+        val body = read_reply(text, body_names[b], horizons_dates[0])?
+        val parent: Option[string] = if b == 0 then None else if body_names[b] == "Moon" then Some("Earth") else Some("Sun")
+        insert(db, Body(body.name, body.naif_id, body_gm_km[b], None, parent, body.epoch_jd, body.pos, body.vel,
+            s"JPL Horizons DE441 ($dir/b${seed_ids[b]}.txt)", body.fetched_at))?
+    db.commit()?
+    Ok(())
+
+private text_or(q: &Query, col: int) -> Result[Option[string], Failure] = Ok(q.text_at(col)?)
+
+/** The row `q` stands on, as a `Body`. */
+private body_at(q: &Query) -> Result[Body, Failure]
+    val naif: Option[long] = if q.type_at(1) == ColumnType.Null then None else Some(q.long_at(1))
+    val radius: Option[real] = if q.type_at(3) == ColumnType.Null then None else Some(q.real_at(3))
+    Ok(Body(text_or(q, 0)?.unwrap_or(""), naif, q.real_at(2), radius, text_or(q, 4)?, q.real_at(5),
+        Vec3(q.real_at(6), q.real_at(7), q.real_at(8)), Vec3(q.real_at(9), q.real_at(10), q.real_at(11)),
+        text_or(q, 12)?.unwrap_or(""), text_or(q, 13)?.unwrap_or("")))
+
+/** Every body the SQL condition `where` selects, in catalog order (`"1"` selects them all). */
+bodies_where(db: &Db, where: string) -> Result[Buf[Body], Failure]
+    val q = db.prepare(s"SELECT $columns FROM bodies WHERE $where ORDER BY rowid")?
+    var out = buf[Body]()
+    while q.step()?
+        out.push(body_at(q)?)
+    Ok(out)
+
+/** The bodies called `names`, in catalog order; a name the catalog lacks is a failure naming it. */
+bodies_named(db: &Db, names: []const string) -> Result[Buf[Body], Failure]
+    val all = bodies_where(db, "1")?
+    var out = buf[Body]()
+    for n in names
+        var found = false
+        for b in all.view()
+            if b.name == n then found = true
+        if !found then return Err(failure(s"the catalog has no body called \"$n\""))
+    for b in all.view()
+        for n in names
+            if b.name == n then out.push(b)
+    Ok(out)
+
+/** The catalog's epoch: the Sun's. */
+catalog_epoch(db: &Db) -> Result[real, Failure]
+    val sun = bodies_where(db, "name = 'Sun'")?
+    if sun.len() == 0 then return Err(failure("the catalog has no Sun; run `orbits seed` first"))
+    Ok(sun[0].epoch_jd)
+
+/** A system of `bodies`, which must share one epoch. */
+system_of(bodies: Buf[Body]) -> Result[System, Failure]
+    if bodies.len() == 0 then return Err(failure("no bodies selected"))
+    var names = buf[string]()
+    var gm = buf[real]()
+    var pos = buf[Vec3]()
+    var vel = buf[Vec3]()
+
+    val t = bodies[0].epoch_jd
+    for b in bodies.view()
+        if b.epoch_jd != t then return Err(failure(s"${b.name} is at JD ${b.epoch_jd}, not the system's $t"))
+        names.push(b.name)
+        gm.push(gm_au(b.gm))
+        pos.push(b.pos)
+        vel.push(b.vel)
+    Ok(system(names, gm, pos, vel, t))
+end system_of

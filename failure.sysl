@@ -1,0 +1,40 @@
+// Every way a command can fail, as one type: SQLite's, DuckDB's, libcurl's, the filesystem's and a
+// number that would not parse each become a `Failure` through `?`, carrying the library's own
+// sentence. A Horizons lookup that matched several bodies also carries the matches, one per line as
+// Horizons printed them, so the caller can show them and the tests can check them.
+
+import sh.sysl.curl as curl
+import sh.sysl.duckdb as duck
+import sh.sysl.sqlite as sqlite
+import sysl.buf.{Buf, buf}
+import sysl.fs.IoError
+import sysl.text.ParseError
+
+struct Failure
+    message: string
+    matches: Buf[string]
+
+/** A failure that is a sentence and nothing else. */
+failure(message: string) -> Failure = Failure(message, buf[string]())
+
+impl Display for Failure
+    display(self, out: *Writer, fmt: FormatSpec)
+        var text = self.message
+        for m in self.matches.view()
+            text = text + "\n    " + m
+        display_str(text, out, fmt)
+
+impl From[sqlite.Error] for Failure
+    from(e: sqlite.Error) -> Failure = failure(s"SQLite: $e")
+
+impl From[duck.Error] for Failure
+    from(e: duck.Error) -> Failure = failure(s"DuckDB: $e")
+
+impl From[curl.Error] for Failure
+    from(e: curl.Error) -> Failure = failure(s"curl: ${e.message}")
+
+impl From[IoError] for Failure
+    from(e: IoError) -> Failure = failure(str(e))
+
+impl From[ParseError] for Failure
+    from(e: ParseError) -> Failure = failure(s"a number: $e")

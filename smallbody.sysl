@@ -1,0 +1,99 @@
+// Small bodies: JPL's Small-Body Database, imported into DuckDB, and turned into catalog rows.
+//
+// The SBDB query API (https://ssd-api.jpl.nasa.gov/sbdb_query.api) answers JSON -- a `fields` list
+// and a `data` array of rows -- and nothing else, so the import is one `read_json` that unnests the
+// rows into a typed table. `orbits import` names the fields it expects; the request is
+//
+//     https://ssd-api.jpl.nasa.gov/sbdb_query.api?fields=spkid,full_name,pdes,name,epoch,e,a,q,i,om,w,ma,n,GM,diameter&sb-kind=a&full-prec=true
+//
+// with `&limit=1000` for the committed sample (`fixtures/sbdb/sample.json`, the first 1000
+// numbered asteroids). The elements are heliocentric osculating ones, ecliptic J2000, at `epoch`
+// (Julian date TDB); angles are degrees, `a` and `q` AU, `n` degrees a day, GM km^3/s^2 and the
+// diameter km.
+
+import sh.sysl.duckdb.Connection
+import sysl.buf.{Buf, buf}
+import sysl.text.{Search, replace_all}
+
+/** The fields an import expects, in order. */
+val sbdb_fields: string ="[spkid, full_name, pdes, name, epoch, e, a, q, i, om, w, ma, n, GM, diameter]"
+
+/** The Sun's GM as the SBDB elements assume it: Gauss's constant squared, AU^3/day^2. */
+val gauss_mu: real = 0.01720209895 * 0.01720209895
+
+private const deg: real = 0.017453292519943295
+
+/** `s` as a single-quoted SQL literal. */
+sql_text(s: string) -> string = "'" + replace_all(s, "'", "''") + "'"
+
+/** One field of the row `r`, as text. */
+private field(k: int, name: string, cast: string) -> string =
+    if cast == "" then "r[" + str(k) + "]->>'$' AS " + name else "(r[" + str(k) + "]->>'$')::" + cast + " AS " + name
+
+/** Import an SBDB query reply (a file path or a URL DuckDB can read) as the table `sbdb`,
+ * replacing it; answers the row count.
+ */
+import_sbdb(con: &Connection, source: string) -> Result[u64, Failure]
+    val fields = con.query(s"SELECT fields::VARCHAR FROM read_json(${sql_text(source)})")?
+    val got = fields.next() match
+        Some(ch) -> ch.column(0).text(0)?.unwrap_or("")
+        None -> ""
+    if got != sbdb_fields then return Err(failure(s"the SBDB reply's fields are $got, not $sbdb_fields"))
+
+    con.exec("CREATE OR REPLACE TABLE sbdb AS SELECT " +
+        field(1, "spkid", "BIGINT") + ", trim(r[2]->>'$') AS full_name, " + field(3, "pdes", "") + ", " +
+        field(4, "name", "") + ", " + field(5, "epoch", "DOUBLE") + ", " + field(6, "e", "DOUBLE") + ", " +
+        field(7, "a", "DOUBLE") + ", " + field(8, "q", "DOUBLE") + ", " + field(9, "i", "DOUBLE") + ", " +
+        field(10, "om", "DOUBLE") + ", " + field(11, "w", "DOUBLE") + ", " + field(12, "ma", "DOUBLE") + ", " +
+        field(13, "n", "DOUBLE") + ", " + field(14, "gm", "DOUBLE") + ", " + field(15, "diameter", "DOUBLE") +
+        s" FROM (SELECT unnest(data) AS r FROM read_json(${sql_text(source)}))")?
+    val n = con.query("SELECT count(*) FROM sbdb")?
+    Ok(n.next() match
+        Some(ch) -> u64(ch.column(0).i64s()?[0])
+        None -> 0)
+end import_sbdb
+
+/** One small body's row of `sbdb`: its name, SPK id, elements and their epoch, GM, diameter. */
+struct SmallBody
+    name: string
+    spkid: long
+    epoch: real
+    elements: Elements
+    gm: Option[real]
+    diameter: Option[real]
+
+    /** Its heliocentric state at Julian date `t`, by two-body motion from the elements' epoch. */
+    heliocentric(self, t: real) -> (Vec3, Vec3) =
+        to_state(self.elements.propagate(gauss_mu, t - self.epoch), gauss_mu)
+
+/** The small bodies `sql` selects -- a query over `sbdb` answering its columns, `SELECT * FROM sbdb
+ * WHERE a < 2.2` for one.
+ */
+small_bodies(con: &Connection, sql: string) -> Result[Buf[SmallBody], Failure]
+    val r = con.query(s"SELECT full_name, spkid, epoch, a, e, i, om, w, ma, gm, diameter FROM ($sql) AS chosen")?
+    var out = buf[SmallBody]()
+
+    loop
+        val ch = r.next() match
+            Some(ch) -> ch
+            None -> break
+        val ids = ch.column(1).i64s()?
+        val f = [ch.column(2).f64s()?, ch.column(3).f64s()?, ch.column(4).f64s()?, ch.column(5).f64s()?,
+            ch.column(6).f64s()?, ch.column(7).f64s()?, ch.column(8).f64s()?, ch.column(9).f64s()?,
+            ch.column(10).f64s()?]
+        val gm = ch.column(9)
+        val dia = ch.column(10)
+        for k in 0..<ch.size()
+            val el = Elements(f[1][k], f[2][k], f[3][k] * deg, f[4][k] * deg, f[5][k] * deg, f[6][k] * deg)
+            out.push(SmallBody(ch.column(0).text(k)?.unwrap_or(""), ids[k], f[0][k], el,
+                if gm.valid(k) then Some(f[7][k]) else None, if dia.valid(k) then Some(f[8][k]) else None))
+    Ok(out)
+end small_bodies
+
+/** `b` as a catalog row at Julian date `t`: barycentric, by adding the Sun's barycentric state `sun`
+ * at `t` to its heliocentric one. A test particle (GM zero) unless the SBDB knows its GM.
+ */
+small_body_row(b: SmallBody, t: real, sun: Body) -> Body
+    val (r, v) = b.heliocentric(t)
+    Body(b.name, Some(b.spkid), b.gm.unwrap_or(0.0), b.diameter.map((d) -> 0.5 * d), Some("Sun"), t,
+        r + sun.pos, v + sun.vel, s"JPL SBDB (osculating elements at JD ${b.epoch}, two-body to JD $t)", "")

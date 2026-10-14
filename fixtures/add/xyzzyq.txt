@@ -1,0 +1,13 @@
+API VERSION: 1.2
+API SOURCE: NASA/JPL Horizons API
+
+*******************************************************************************
+JPL/DASTCOM            Small-body Index Search Results     2026-Oct-14 01:27:36
+
+ Comet AND asteroid index search:
+
+   NAME = Xyzzyq;
+
+ Matching small-bodies: 
+    No matches found.
+*******************************************************************************

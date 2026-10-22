@@ -3,8 +3,9 @@
  *
  *     cc -O2 -o force bench/force.c -lm && ./force 200000
  *
- * It prints the same energy and Earth x as the sysl program, which is the check that the two did
- * the same arithmetic.
+ * It prints the energy and Earth x the sysl program prints. The two agree to about twelve figures
+ * rather than bit for bit: both fuse a multiply feeding an add, but clang leaves some of those apart
+ * depending on how it vectorizes, and sysl fuses every one.
  */
 #include <math.h>
 #include <stdio.h>

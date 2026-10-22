@@ -22,11 +22,6 @@ checkouts. cairo needs `brew install cairo` (or `libcairo2-dev`), DuckDB `brew i
 DuckDB ships no `.pc` file, so every build names its directories. SQLite and libcurl are found by
 pkg-config.
 
-**`sysl build .` and `sysl run .` are refused by sysl 0.1.0-alpha.12** with `no module is called
-'sh.sysl.png'`: they analyse the `@tests` files, which import the test-only `png`, although the
-packages reference says every build but `sysl test` drops them. Until the compiler is fixed the
-program builds from a copy without `tests.sysl` and `catalog_tests.sysl`.
-
 Commands
 --------
 
@@ -184,17 +179,22 @@ Speed
 -----
 
 The force loop against `bench/force.c` at `-O2`, one million Yoshida steps of the 11-body system
-(three force evaluations a step, 55 pairs each), on an Apple M-series machine:
+(three force evaluations a step, 55 pairs each), on an Apple M-series machine, the median of five
+alternating runs:
 
 | | time |
 |---|---|
-| C, `cc -O2` | 0.27 s |
-| C, `cc -O2 -ffp-contract=off` | 0.30 s |
-| sysl, `optimization = "2"` | 0.36 s |
+| C, `cc -O2` | 0.259 s |
+| C, `cc -O2 -ffp-contract=off` | 0.293 s |
+| sysl 0.3.11, `optimization = "2"` | 0.259 s |
 
-sysl is 1.2× the C program that does the same arithmetic. Against `-ffp-contract=off` the final
-state is **bit-identical**: sysl does not fuse a multiply and an add into an FMA, so it rounds every
-operation as written, and clang's default does fuse them.
+**sysl runs as fast as the C.** The loop is written with `Vec3`'s operators, `ai + d * (m[j] * inv)`,
+and sysl reads an operator whose body is one expression as that body. Each component's multiply
+and add then become one fused multiply-add, as clang makes of C's `ai.x += d.x * mj`.
+
+The final state is the same at every optimization level, because sysl fuses every multiply that
+feeds an add. It matches neither C build bit for bit: clang fuses some sites and leaves others
+apart depending on how it vectorizes. The energies agree to twelve significant figures.
 
 License
 -------

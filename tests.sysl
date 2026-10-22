@@ -130,10 +130,13 @@ momentum_is_conserved()
     val s = horizons_system(0)
     val (r0, v0) = s.barycentre()
 
+    // The pair forces are equal and opposite only to rounding, so the barycentre's velocity wanders
+    // by rounding too: each of the 2000 steps' 330 pair updates moves it by about 1e-21, and a random
+    // walk of those is under 1e-18. A force that broke Newton's third law would move it by far more.
     advance(s, 0.5, 2000, Integrator.Yoshida)
     val (r1, v1) = s.barycentre()
-    assert(distance(v1, v0) < 1e-19, "the barycentre's velocity does not change")
-    assert(distance(r1, r0 + v0 * 1000.0) < 1e-15, "so it has moved by v t")
+    assert(distance(v1, v0) < 1e-18, s"the barycentre's velocity does not change (it moved ${distance(v1, v0)}, from ${v0.norm()})")
+    assert(distance(r1, r0 + v0 * 1000.0) < 1e-15, s"so it has moved by v t (off by ${distance(r1, r0 + v0 * 1000.0)})")
 
 @test("leapfrog run forward and then backward returns to where it started")
 leapfrog_is_reversible()

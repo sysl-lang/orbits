@@ -7,7 +7,7 @@
 package {
   name    = "orbits"
   version = "0.1.0"
-  sysl    = "0.1.0-alpha.12"
+  sysl    = "0.3.11"
 }
 
 // The integrator's inner loop is the whole cost, and the comparison against C is made at -O2.

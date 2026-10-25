@@ -28,7 +28,7 @@ sql_text(s: string) -> string = "'" + replace_all(s, "'", "''") + "'"
 
 /** One field of the row `r`, as text. */
 private field(k: int, name: string, cast: string) -> string =
-    if cast == "" then "r[" + str(k) + "]->>'$' AS " + name else "(r[" + str(k) + "]->>'$')::" + cast + " AS " + name
+    if cast == "" then "r[" + k.to_string() + "]->>'$' AS " + name else "(r[" + k.to_string() + "]->>'$')::" + cast + " AS " + name
 
 /** Import an SBDB query reply (a file path or a URL DuckDB can read) as the table `sbdb`,
  * replacing it; answers the row count.

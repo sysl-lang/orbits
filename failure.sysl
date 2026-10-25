@@ -34,7 +34,7 @@ impl From[curl.Error] for Failure
     from(e: curl.Error) -> Failure = failure(s"curl: ${e.message}")
 
 impl From[IoError] for Failure
-    from(e: IoError) -> Failure = failure(str(e))
+    from(e: IoError) -> Failure = failure(e.to_string())
 
 impl From[ParseError] for Failure
     from(e: ParseError) -> Failure = failure(s"a number: $e")

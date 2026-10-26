@@ -34,16 +34,8 @@ dependencies {
   curl       { git = "github.com/sysl-lang/curl", version = "0.1.3" }
 }
 
-// `bench/force.c` is the C side of the `--bench` comparison, compiled by hand and not part of the build:
-// the pattern claims the directory so the walk does not warn about it, and `exclude` takes its one
-// file back out.
-c {
-  bench {
-    root    = "bench"
-    sources = ["*.c"]
-    exclude = ["force.c"]
-  }
-}
+// `bench/force.c` is the C side of the `--bench` comparison, compiled by hand and not part of the build.
+exclude = ["bench"]
 
 // The tests decode the PNG cairo writes with a decoder that is not cairo's.
 dev_dependencies {

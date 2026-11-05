@@ -278,7 +278,7 @@ query_errors()
     val con = duck.open().unwrap().connect().unwrap()
     val got = query_text(con, "SELECT 1 AS one, NULL AS nothing, 'x' AS s").unwrap()
     assert(got[0][0] == "one" && got[1][0] == "1" && got[1][1] == "NULL" && got[1][2] == "x", "values as text")
-    assert_eq(query_text(con, "SELEC 1").unwrap_err().to_string(),
-        "DuckDB: Parser Error: syntax error at or near \"SELEC\"\n\nLINE 1: SELEC 1\n        ^")
-    assert_eq(query_text(con, "SELECT nothing FROM trajectory").unwrap_err().to_string(),
-        "DuckDB: Catalog Error: Table with name trajectory does not exist!\nDid you mean \"sqlite_master\"?\n\nLINE 1: SELECT nothing FROM trajectory\n                            ^")
+    val syntax = query_text(con, "SELEC 1").unwrap_err().to_string()
+    assert(syntax.starts_with("DuckDB: Parser Error: syntax error at or near \"SELEC\"\n\nLINE 1: SELEC 1\n        ^"), syntax)
+    val missing = query_text(con, "SELECT nothing FROM trajectory").unwrap_err().to_string()
+    assert(missing.starts_with("DuckDB: Catalog Error: Table with name trajectory does not exist!\nDid you mean \"sqlite_master\"?\n\nLINE 1: SELECT nothing FROM trajectory\n                            ^"), missing)

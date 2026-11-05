@@ -78,7 +78,7 @@ seeded_system()
     var err = 0.0
     for b in 0..<s.count()
         assert(same(s.pos[b], truth.pos[b]), s"${s.names[b]} 30 days on, to the bit")
-        err = max(err, (s.pos[b] - horizons.pos[b]).norm())
+        err = err.max((s.pos[b] - horizons.pos[b]).norm())
     assert(err < 2e-7, "and so within stage 1's 2e-7 AU of Horizons 30 days on")
 
 @test("a system is chosen from the catalog by name or by SQL")

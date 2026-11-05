@@ -29,7 +29,7 @@ private worst(how: Integrator, dt: real, d: int, from: usize, to: usize) -> real
 
     advance(s, dt, steps, how)
     for b in from..<to
-        err = max(err, distance(s.pos[b], truth.pos[b]))
+        err = err.max(distance(s.pos[b], truth.pos[b]))
     err
 
 // -- against JPL Horizons ----------------------------------------------------------------------------
@@ -99,8 +99,8 @@ private drift(how: Integrator, years: int) -> (real, real)
 
     for _ in 0..<years
         advance(s, 1.0, 365, how)
-        de = max(de, ((s.energy() - e0) / e0).abs())
-        dl = max(dl, distance(s.angular_momentum(), l0) / l0.norm())
+        de = de.max(((s.energy() - e0) / e0).abs())
+        dl = dl.max(distance(s.angular_momentum(), l0) / l0.norm())
     (de, dl)
 
 @test("a symplectic integrator keeps energy bounded for a thousand years, and RK4 does not")
@@ -150,7 +150,7 @@ leapfrog_is_reversible()
 
     var err = 0.0
     for b in 0..<s.count()
-        err = max(err, distance(s.pos[b], start.pos[b]) / max(1.0, start.pos[b].norm()))
+        err = err.max(distance(s.pos[b], start.pos[b]) / start.pos[b].norm().max(1.0))
     assert(err < 16.0 * real(n) * real.epsilon(), "within a few ulps of the position per step")
 
 @test("RK4 run forward and backward does not return: it is not time-symmetric")
@@ -290,7 +290,7 @@ private two_body(el: Elements, dt: real, days: real) -> real
         step(s, dt, Integrator.Yoshida)
         if k % every == 0
             val (want, _) = to_state(el.propagate(mu_sun, real(k) * dt), mu_sun)
-            err = max(err, distance(s.pos[1], want) / el.a.abs())
+            err = err.max(distance(s.pos[1], want) / el.a.abs())
     err
 end two_body
 

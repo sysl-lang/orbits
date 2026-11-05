@@ -7,7 +7,7 @@
 package {
   name    = "orbits"
   version = "0.1.0"
-  sysl    = "0.6.0"
+  sysl    = "0.9.0"
 }
 
 // The integrator's inner loop is the whole cost, and the comparison against C is made at -O2.
@@ -39,5 +39,5 @@ exclude = ["bench"]
 
 // The tests decode the PNG cairo writes with a decoder that is not cairo's.
 dev_dependencies {
-  png { git = "github.com/sysl-lang/png", version = "0.2.1" }
+  png { git = "github.com/sysl-lang/png", version = "0.2.3" }
 }

@@ -71,8 +71,8 @@ kepler_hyperbolic(m: real, e: real) -> real
     if !(e > 1.0) || !m.is_finite() then return real.nan()
 
     val am = m.abs()
-    var h = min((6.0 * am).cbrt(), am / (e - 1.0))
-    if am >= 3.0 then h = min(h, (2.0 * am / e).asinh())
+    var h = (6.0 * am).cbrt().min(am / (e - 1.0))
+    if am >= 3.0 then h = h.min((2.0 * am / e).asinh())
     h = h.copysign(m)
 
     for _ in 0..<100

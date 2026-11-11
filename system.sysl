@@ -82,19 +82,18 @@ accelerations(gm: Buf[real], pos: Buf[Vec3], acc: Buf[Vec3])
     val n = gm.len()
     val p = pos.view()
     val m = gm.view()
-    var a = acc.view()
 
     for i in 0..<n
-        a[i] = Vec3.zero()
+        acc[i] = Vec3.zero()
 
     for i in 0..<n
         val pi = p[i]
-        var ai = a[i]
+        var ai = acc[i]
         for j in i + 1..<n
             val d = p[j] - pi
             val r2 = d.norm2()
             val inv = 1.0 / (r2 * r2.sqrt())
             ai = ai + d * (m[j] * inv)
-            a[j] = a[j] - d * (m[i] * inv)
-        a[i] = ai
+            acc[j] = acc[j] - d * (m[i] * inv)
+        acc[i] = ai
 end accelerations
